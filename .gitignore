@@ -1,0 +1,9 @@
+node_modules/
+bun.lock
+package-lock.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

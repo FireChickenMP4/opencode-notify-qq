@@ -1,0 +1,16 @@
+{
+  "name": "opencode-notify-qq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Push notifications from opencode to QQ, via the official QQ bot API",
+  "scripts": {
+    "check": "bun run src/notify.ts --check",
+    "send": "bun run src/notify.ts",
+    "listen": "bun run src/listen.ts"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.15.13",
+    "@types/bun": "^1.4.2"
+  }
+}
