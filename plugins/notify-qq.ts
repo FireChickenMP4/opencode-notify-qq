@@ -21,6 +21,9 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/** Where the auto-spawned bridge writes stdout+stderr. */
+const BRIDGE_LOG = join(HERE, "bridge.log");
+
 /**
  * File log for the event path.
  *
@@ -93,7 +96,7 @@ async function ensureBridge(): Promise<void> {
     const { spawn } = await import("node:child_process");
     const { dirname, join } = await import("node:path");
     const { fileURLToPath } = await import("node:url");
-    const { existsSync } = await import("node:fs");
+    const { existsSync, openSync } = await import("node:fs");
     const here = dirname(fileURLToPath(import.meta.url));
     // Installed layout: <plugins>/notify-qq/bridge.ts ; repo layout: <repo>/src/bridge.ts
     const candidates = [join(here, "notify-qq", "bridge.ts"), join(here, "..", "src", "bridge.ts")];
@@ -102,13 +105,16 @@ async function ensureBridge(): Promise<void> {
       trace(`bridge not started: script not found (${candidates.join(", ")})`);
       return;
     }
+    const logFd = openSync(BRIDGE_LOG, "a");
     const child = spawn("bun", ["run", script], {
       detached: true,
-      stdio: "ignore",
+      // Log to a file, not /dev/null: when the bridge misbehaves (bad server
+      // URL, gateway conflict) the only way to see why is this output.
+      stdio: ["ignore", logFd, logFd],
       windowsHide: true,
     });
     child.unref();
-    trace(`bridge spawned pid=${child.pid}`);
+    trace(`bridge spawned pid=${child.pid} (log: ${BRIDGE_LOG})`);
   } catch (cause) {
     trace(`bridge spawn failed: ${cause instanceof Error ? cause.message : cause}`);
   }

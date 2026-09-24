@@ -126,30 +126,48 @@ export function parseCommand(text: string): Command | undefined {
 /** The session a command should act on: the most recent one we have seen. */
 let lastSessionID: string | null = null;
 
+/**
+ * Fallback target when no event has been seen yet: the most recently updated
+ * session. Without this, `.stop` right after startup says "no known session"
+ * even though there is an obvious candidate.
+ */
+async function mostRecentSession(): Promise<string | null> {
+  try {
+    const res = await fetch(`${BASE}/session`);
+    if (!res.ok) return null;
+    const list = (await res.json()) as Array<{ id?: string; time?: { updated?: number } }>;
+    const sorted = [...list].sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
+    return sorted[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function runCommand(cmd: Command): Promise<void> {
-  if (!lastSessionID) {
+  const target = lastSessionID ?? (await mostRecentSession());
+  if (!target) {
     await sendText(`没有已知会话，无法执行 .${cmd.kind}`);
     return;
   }
   try {
     if (cmd.kind === "stop") {
-      await fetch(`${BASE}/session/${lastSessionID}/abort`, { method: "POST" });
-      await sendText("已中断当前执行");
+      await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
+      await sendText(`已中断当前执行 [${await sessionDirectory(target)}]`);
       log("command: stop");
       return;
     }
 
     if (cmd.kind === "restart") {
       // No dedicated endpoint; abort then send a continuation prompt.
-      await fetch(`${BASE}/session/${lastSessionID}/abort`, { method: "POST" });
+      await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
       await sendText("已中断，正在重启工作流");
-      await prompt(lastSessionID, "Continue from where you left off. Re-state the plan and resume.");
+      await prompt(target, "Continue from where you left off. Re-state the plan and resume.");
       log("command: restart");
       return;
     }
 
     // task = queue for after this turn; ask = steer into it now.
-    await prompt(lastSessionID, cmd.text, cmd.kind === "task" ? "queue" : "steer");
+    await prompt(target, cmd.text, cmd.kind === "task" ? "queue" : "steer");
     await sendText(`已${cmd.kind === "task" ? "排队" : "插话"}: ${cmd.text.slice(0, 80)}`);
     log(`command: ${cmd.kind}`);
   } catch (cause) {
@@ -182,6 +200,11 @@ const CONFIRM: Record<Verdict, string> = {
 
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
+    // Track the most recent session from ANY event, not just permissions:
+    // `.stop` / `.task` need a target even when no permission has fired.
+    const anySessionID = event.properties?.sessionID;
+    if (typeof anySessionID === "string" && anySessionID) lastSessionID = anySessionID;
+
     if (event.type !== "permission.updated" && event.type !== "permission.asked") return;
     const p = event.properties ?? {};
     const requestID = typeof p.id === "string" ? p.id : undefined;
@@ -205,7 +228,6 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
     const directory = await sessionDirectory(sessionID);
-    if (sessionID) lastSessionID = sessionID;
 
     pending.set(requestID, { requestID, sessionID, permission });
     await sendText(
@@ -268,6 +290,7 @@ async function subscribeEvents(
   signal: AbortSignal,
 ): Promise<void> {
   let backoff = 1000;
+  let announced = false;
   while (!signal.aborted) {
     try {
       const res = await fetch(`${BASE}/event`, {
@@ -276,6 +299,7 @@ async function subscribeEvents(
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
       backoff = 1000;
+      announced = false;
       log("subscribed to opencode events");
 
       const reader = res.body.getReader();
@@ -304,6 +328,13 @@ async function subscribeEvents(
       throw new Error("stream ended");
     } catch (cause) {
       if (signal.aborted) return;
+      // Say it once, loudly, because the usual cause is "no opencode serve
+      // running at BASE" - which otherwise looks like the bridge doing nothing.
+      if (!announced) {
+        announced = true;
+        log(`cannot reach opencode at ${BASE} - is "opencode serve" running?`);
+        log(`(remote approvals need serve + attach, not a plain "opencode")`);
+      }
       log(`event stream dropped (${cause instanceof Error ? cause.message : cause}); retry in ${backoff}ms`);
       await sleep(backoff);
       backoff = Math.min(backoff * 2, 30_000);
