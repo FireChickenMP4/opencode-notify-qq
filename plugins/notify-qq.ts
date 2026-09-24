@@ -134,6 +134,34 @@ async function isPortOpen(port: number): Promise<boolean> {
   return result === true;
 }
 
+/**
+ * Pick the turn's closing text from a message list.
+ *
+ * Rule: the LAST assistant message that has text and no tool part. A message
+ * that calls a tool is not a conclusion, so it is skipped. Walking stops at the
+ * first user message (turn boundary).
+ *
+ * Exported for testing: this selection was wrong twice, so it is locked down.
+ */
+export function pickFinalText(
+  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
+): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.info?.role === "user") break;
+    if (m.info?.role !== "assistant") continue;
+    const parts = m.parts ?? [];
+    if (parts.some((p) => p.type === "tool")) continue;
+    const text = parts
+      .filter((p) => p.type === "text" && p.text?.trim())
+      .map((p) => p.text!.trim())
+      .join("\n\n")
+      .trim();
+    if (text) return text;
+  }
+  return "";
+}
+
 export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   let api: Client | null = null;
   let loadError: string | null = null;
@@ -233,50 +261,35 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
-   * The assistant's output for the turn that just ended.
+   * The assistant's closing text for the turn that just ended.
    *
-   * "Last message containing text" is wrong: the final message is often a
-   * tool-call step whose only text is a one-line preamble, so the push shows a
-   * fragment. Instead collect every assistant text part since the last user
-   * message - that set is exactly what the agent said this turn, including the
-   * wrap-up after its tool calls.
+   * The wrap-up is the LAST assistant message that has text but NO tool part.
+   * Two wrong guesses preceded this:
+   *   - "last message with text": often a tool-call step whose only text is a
+   *     one-line preamble, so the push showed a fragment.
+   *   - "collect all text this turn and truncate the head": produced a
+   *     "...(前略)" marker and glued preambles to the answer.
+   * See pickFinalText for the rule.
    *
    * Reads the transcript rather than calling /summarize (another model turn,
-   * slow and costly) since we only need what the agent already wrote.
+   * slow and costly) since the answer is already written.
    */
   async function lastAssistantText(sessionID: string): Promise<string> {
     try {
       const res = await client.session.messages({ path: { id: sessionID } });
-      const messages = (res as { data?: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }> }).data;
-      if (!Array.isArray(messages)) return "";
-
-      const collected: string[] = [];
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i]!;
-        if (m.info?.role === "user") break;
-        if (m.info?.role !== "assistant") continue;
-        for (const p of m.parts ?? []) {
-          if (p.type === "text" && p.text?.trim()) collected.push(p.text.trim());
-        }
-      }
-      collected.reverse();
-
-      // Intermediate preambles ("I'll check X...") sit before the real answer;
-      // the substance is usually in the later blocks. Keep the tail.
-      return collected.join("\n\n").trim();
+      const messages = (res as { data?: Parameters<typeof pickFinalText>[0] }).data;
+      return Array.isArray(messages) ? pickFinalText(messages) : "";
     } catch {
       return "";
     }
   }
 
   /**
-   * Condense the turn's final assistant output for a push.
+   * Normalize the closing text for a push.
    *
-   * We take the WHOLE last assistant message (that is what the agent ended the
-   * turn with), not one paragraph of it - picking "the last paragraph" grabbed
-   * trailing questions ("want me to...?"), and picking "the first" grabbed
-   * headings. Markdown is preserved so QQ renders it; only runaway blank lines
-   * are collapsed and the length is capped.
+   * The input is already the turn's final text-only message, so it is complete:
+   * just tidy whitespace and cap runaway length. Markdown is preserved so QQ
+   * renders it.
    */
   function headline(text: string): string {
     const body = text
@@ -284,10 +297,7 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       .replace(/[ \t]+$/gm, "")
       .trim();
     if (body.length < 4) return "";
-    if (body.length <= 600) return body;
-    // Too long: keep the TAIL, which holds the wrap-up (the head is usually
-    // preambles like "I'll check..."), and mark that it was trimmed.
-    return `...(前略)\n\n${body.slice(-597)}`;
+    return body.length > 800 ? `${body.slice(0, 797)}...` : body;
   }
 
   return {
