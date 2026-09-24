@@ -48,6 +48,9 @@ function trace(line: string): void {
     setAwayNotify: (enabled: boolean) => boolean;
     /** Read-only session numbers, shared with the bridge via file. */
     sessionNumber: (sessionID: string) => number | undefined;
+    /** Long-running bash watchdog (timer-based). */
+    BashWatch: typeof import("../src/bash-watch").BashWatch;
+    bashAlert: typeof import("../src/bash-watch").bashAlert;
   };
 
 // The client sources sit next to this file once installed as
@@ -60,6 +63,7 @@ async function loadClient(): Promise<Client> {
       const qqbot = await import(qqbotPath);
       const config = await import(qqbotPath.replace("qqbot.ts", "config.ts"));
       const sessions = await import(qqbotPath.replace("qqbot.ts", "sessions.ts"));
+      const watch = await import(qqbotPath.replace("qqbot.ts", "bash-watch.ts"));
       return {
         sendText: qqbot.sendText,
         sendMarkdown: qqbot.sendMarkdown,
@@ -69,6 +73,8 @@ async function loadClient(): Promise<Client> {
         // Re-read each call: the bridge allocates numbers while we run, and this
         // plugin is long-lived, so a cached read would go stale.
         sessionNumber: (sessionID: string) => sessions.readSessionNumbers().lookup(sessionID),
+        BashWatch: watch.BashWatch,
+        bashAlert: watch.bashAlert,
       };
     } catch {
       continue;
@@ -406,6 +412,30 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     return true;
   }
 
+  /**
+   * Warn when a bash command has run too long.
+   *
+   * opencode eventually kills it (120s default), but while you are away nothing
+   * says it is stuck - and `retry` only covers model API retries, not the shell.
+   * A blocked command emits no more events, so this is timer-based.
+   * Disable with OPENCODE_NOTIFY_QQ_BASH_MS=0.
+   */
+  const BASH_WATCH_MS = Number(process.env.OPENCODE_NOTIFY_QQ_BASH_MS ?? 90_000);
+  /** Most recent command text per call, so the alert can show it. */
+  const bashCommands = new Map<string, string>();
+  const bashWatch =
+    BASH_WATCH_MS > 0 && api
+      ? new api.BashWatch(BASH_WATCH_MS, {
+          schedule: (ms, fn) => setTimeout(fn, ms),
+          cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+        }, ({ callID, startMs }) => {
+          if (!awayEnabled()) return;
+          const cmd = bashCommands.get(callID) ?? "";
+          void trySend(api!.bashAlert(cmd, Date.now() - startMs), true);
+          trace(`bash long: ${cmd.slice(0, 60)}`);
+        })
+      : null;
+
   type SessionInfo = { parentID?: string; title?: string };
   const sessionCache = new Map<string, SessionInfo>();
 
@@ -475,6 +505,25 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   return {
     event: async ({ event }) => {
       const type = event.type;
+
+      // Bash watchdog: track tool parts so a stuck command is noticed.
+      if (type === "message.part.updated") {
+        const part = (event as { properties?: { part?: { type?: string; tool?: string; callID?: string; state?: { status?: string; time?: { start?: number }; input?: { command?: string } } } } }).properties?.part;
+        if (part?.type === "tool" && part.tool === "bash" && part.callID && bashWatch) {
+          const cmd = part.state?.input?.command;
+          if (cmd) bashCommands.set(part.callID, cmd);
+          bashWatch.observe({
+            callID: part.callID,
+            status: part.state?.status ?? "running",
+            startMs: part.state?.time?.start,
+          });
+          if (part.state?.status === "completed" || part.state?.status === "error") {
+            bashCommands.delete(part.callID);
+          }
+        }
+        return;
+      }
+
       if (type !== "permission.asked" && type !== "session.status") return;
       trace(`event:${type}`);
 
