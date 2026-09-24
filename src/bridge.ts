@@ -105,18 +105,26 @@ async function sessionDirectory(sessionID: string): Promise<string> {
   return (await sessionInfo(sessionID)).directory ?? "(unknown)";
 }
 
-/** True while the session has a turn running (status "busy" or "retry"). */
+/**
+ * True while the session has a turn running.
+ *
+ * On a failed status lookup this returns TRUE (assume busy). The two mistakes
+ * are not equal: wrongly queueing is harmless (the message waits for an idle
+ * that will come), while wrongly assuming idle injects the message straight
+ * into the turn - turning `.task` into an interruption, which is the opposite
+ * of what it means.
+ */
 async function sessionIsBusy(sessionID: string): Promise<boolean> {
   try {
     const res = await fetch(`${BASE}/session/status`);
-    if (!res.ok) return false;
+    if (!res.ok) return true;
     const all = (await res.json()) as Record<string, { type?: string }>;
     const t = all[sessionID]?.type;
+    // Absent from the map means no runner is active -> idle.
+    if (!(sessionID in all)) return false;
     return t === "busy" || t === "retry";
   } catch {
-    // On failure assume idle: injecting is the intent, and a wrong "busy"
-    // would silently strand the message.
-    return false;
+    return true;
   }
 }
 
@@ -164,30 +172,24 @@ export function parseReply(text: string): Verdict | undefined {
 
 export type Command =
   | { kind: "task" | "ask"; text: string; target?: number }
-  | { kind: "stop"; target?: number }
-  | { kind: "restart"; target?: number };
+  | { kind: "stop"; target?: number };
 
 /**
  * Parse a leading-dot command. Returns undefined for anything else, so ordinary
  * chatter and o/a/r replies pass through untouched.
  *
- *   .task <text>      inject a message; runs after the current turn
- *   .ask  <text>      same injection (kept as a distinct word for habit)
+ *   .task <text>      queue a message; runs after the current turn (or now if idle)
+ *   .ask  <text>      steer into the running turn immediately
  *   .stop             abort the running turn (highest priority)
- *   .restart          restart the session's agent loop (abort + continue)
  *
  * Any command may name a session by number: `.stop #2`, `.task #1 do x`. The
  * leading dot accepts ASCII, full-width, or the Chinese ideographic full stop,
  * since a phone IME often produces the last one.
- *
- * Note: both .task and .ask queue after the running turn. opencode has no
- * working "steer into the middle of the current turn" route - the v2 delivery
- * flag is accepted but never honoured (see prompt()).
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|stop|restart)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|stop)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop" | "restart";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -199,7 +201,7 @@ export function parseCommand(text: string): Command | undefined {
     rest = (t[2] ?? "").trim();
   }
 
-  if (kind === "stop" || kind === "restart") return { kind, target };
+  if (kind === "stop") return { kind, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
   return { kind, text: rest, target };
 }
@@ -357,15 +359,6 @@ async function runCommand(cmd: Command): Promise<void> {
       await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
       await sendText(`已中断 ${tag}`);
       log("command: stop");
-      return;
-    }
-
-    if (cmd.kind === "restart") {
-      // No dedicated endpoint; abort then send a continuation prompt.
-      await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
-      await sendText(`已中断，正在重启工作流 ${tag}`);
-      await prompt(target, "Continue from where you left off. Re-state the plan and resume.");
-      log("command: restart");
       return;
     }
 
@@ -532,7 +525,7 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
     if (event.t !== "C2C_MESSAGE_CREATE" && event.t !== "GROUP_AT_MESSAGE_CREATE") return;
     const content = (event.d as { content?: string } | undefined)?.content ?? "";
 
-    // Commands (.task / .ask / .stop / .restart) are checked first: their
+    // Commands (.task / .ask / .stop) are checked first: their
     // leading word makes them unambiguous against the o/a/r replies.
     const command = parseCommand(content);
     if (command) {

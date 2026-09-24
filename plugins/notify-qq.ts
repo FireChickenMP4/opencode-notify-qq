@@ -256,6 +256,33 @@ export function pickFinalText(
 }
 
 /**
+ * The most recent thing the agent actually said, even from a tool step.
+ *
+ * Used only when pickFinalText finds no clean conclusion: an interrupted turn
+ * (the last step errored or was aborted) ends on a tool message and has no
+ * text-only message at all, so the push would otherwise show no body. A short
+ * "let me check X" beats a blank notification.
+ *
+ * Exported for testing.
+ */
+export function pickFallbackText(
+  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
+): string {
+  let start = messages.length - 1;
+  while (start >= 0 && messages[start]?.info?.role === "user") start--;
+
+  for (let i = start; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.info?.role === "user") break;
+    if (m.info?.role !== "assistant") continue;
+    const texts = (m.parts ?? []).filter((p) => p.type === "text" && p.text?.trim());
+    const last = texts[texts.length - 1];
+    if (last?.text?.trim()) return last.text.trim();
+  }
+  return "";
+}
+
+/**
  * Tidy the turn's closing text for a push.
  *
  * The input is already the final text-only message, so it is complete and must
@@ -331,6 +358,37 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
+   * Retry tracking, keyed by session.
+   *
+   * The `retry` status carries the attempt count and the next delay. We only
+   * warn about a *long* failing streak, and only once per streak, so the state
+   * is {start, notified}; it clears when the turn reaches idle.
+   */
+  const retryStreak = new Map<string, { start: number; notified: boolean }>();
+  /** Warn once a streak has been failing this long. */
+  const RETRY_NOTIFY_MS = Number(process.env.OPENCODE_NOTIFY_QQ_RETRY_MS ?? 60_000);
+
+  function handleRetry(sessionID: string | undefined, attempt?: number, message?: string): void {
+    if (!sessionID) return;
+    let streak = retryStreak.get(sessionID);
+    if (!streak) {
+      streak = { start: Date.now(), notified: false };
+      retryStreak.set(sessionID, streak);
+    }
+    const elapsed = Date.now() - streak.start;
+    if (elapsed < RETRY_NOTIFY_MS) {
+      trace(`retry attempt ${attempt ?? "?"} (${Math.round(elapsed / 1000)}s < ${RETRY_NOTIFY_MS / 1000}s, quiet)`);
+      return;
+    }
+    if (streak.notified) return; // already warned about this streak
+    if (!awayEnabled()) return;
+    streak.notified = true;
+    const secs = Math.round(elapsed / 1000);
+    const detail = message ? `\n\n\`${message.slice(0, 120)}\`` : "";
+    void trySend(`**opencode · 重试中**\n\n\`${workspace}\`\n\n已重试 ${attempt ?? "?"} 次，持续约 ${secs}s${detail}`, true);
+  }
+
+  /**
    * Suppress duplicates within a short window.
    *
    * One finished turn can emit several `session.status` idle signals in the
@@ -390,7 +448,10 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     try {
       const res = await client.session.messages({ path: { id: sessionID } });
       const messages = (res as { data?: Parameters<typeof pickFinalText>[0] }).data;
-      return Array.isArray(messages) ? pickFinalText(messages) : "";
+      if (!Array.isArray(messages)) return "";
+      // Prefer the clean conclusion; fall back to the last thing said (a
+      // fragmented sentence) so an interrupted turn still shows a body.
+      return pickFinalText(messages) || pickFallbackText(messages);
     } catch {
       return "";
     }
@@ -440,8 +501,18 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       }
 
       // V2 signals "done" via session.status with status.type === "idle".
-      const props = (event as { properties?: { sessionID?: string; status?: { type?: string } } }).properties;
+      const props = (event as { properties?: { sessionID?: string; status?: { type?: string; attempt?: number; message?: string; next?: number } } }).properties;
+
+      // A retry means the model call failed and is being re-attempted. A single
+      // retry is normal and must not wake you; only a streak that keeps failing
+      // long enough is worth a message. Notify once per streak.
+      if (props?.status?.type === "retry") {
+        handleRetry(props.sessionID, props.status.attempt, props.status.message);
+        return;
+      }
       if (props?.status?.type !== "idle") return;
+      // A turn that ends clears any retry streak for the session.
+      if (props.sessionID) retryStreak.delete(props.sessionID);
 
       // Subagents finish while the main session keeps working; reporting them
       // as "done" is misleading and noisy. Off unless explicitly enabled.

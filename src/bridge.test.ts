@@ -56,9 +56,12 @@ describe("parseCommand", () => {
     expect(parseCommand(".ask what about x")).toEqual({ kind: "ask", text: "what about x" });
   });
 
-  test("stop and restart take no body", () => {
+  test("stop takes no body", () => {
     expect(parseCommand(".stop")).toEqual({ kind: "stop" });
-    expect(parseCommand(".restart")).toEqual({ kind: "restart" });
+  });
+
+  test("restart is no longer a command", () => {
+    expect(parseCommand(".restart")).toBeUndefined();
   });
 
   test("case-insensitive, full-width and Chinese dot", () => {

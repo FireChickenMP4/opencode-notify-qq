@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { pickFinalText } from "../plugins/notify-qq";
+import { pickFallbackText, pickFinalText } from "../plugins/notify-qq";
 
 const A = (parts: Array<{ type: string; text?: string }>) => ({ info: { role: "assistant" }, parts });
 const U = (text: string) => ({ info: { role: "user" }, parts: [{ type: "text", text }] });
@@ -79,5 +79,46 @@ describe("pickFinalText", () => {
 
   test("all-user input yields empty", () => {
     expect(pickFinalText([U("a"), U("b")])).toBe("");
+  });
+});
+
+describe("pickFallbackText", () => {
+  test("returns the last text from a tool-step message", () => {
+    const msgs = [
+      U("go"),
+      A([{ type: "text", text: "let me check the logs" }, { type: "tool" }]),
+    ];
+    expect(pickFallbackText(msgs)).toBe("let me check the logs");
+  });
+
+  test("takes the LAST text part, not the first", () => {
+    const msgs = [
+      U("go"),
+      A([{ type: "text", text: "starting" }, { type: "text", text: "and now the real bit" }, { type: "tool" }]),
+    ];
+    expect(pickFallbackText(msgs)).toBe("and now the real bit");
+  });
+
+  test("prefers nothing over a tool-only step", () => {
+    const msgs = [U("go"), A([{ type: "tool" }])];
+    expect(pickFallbackText(msgs)).toBe("");
+  });
+
+  test("skips a trailing injected .task too", () => {
+    const msgs = [
+      U("earlier"),
+      A([{ type: "text", text: "fragment before the tool" }, { type: "tool" }]),
+      U(".task next"),
+    ];
+    expect(pickFallbackText(msgs)).toBe("fragment before the tool");
+  });
+
+  test("stops at the turn boundary", () => {
+    const msgs = [
+      A([{ type: "text", text: "old" }, { type: "tool" }]),
+      U("new turn"),
+      A([{ type: "tool" }]),
+    ];
+    expect(pickFallbackText(msgs)).toBe("");
   });
 });
