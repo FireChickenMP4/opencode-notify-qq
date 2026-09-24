@@ -7,7 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { normalizeFinalText } from "../plugins/notify-qq";
+import { normalizeFinalText } from "../src/notify-helpers";
 
 describe("normalizeFinalText", () => {
   test("keeps a long reply intact under the cap", () => {

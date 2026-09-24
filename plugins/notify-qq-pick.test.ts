@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { pickFallbackText, pickFinalText } from "../plugins/notify-qq";
+import { pickFallbackText, pickFinalText } from "../src/notify-helpers";
 
 const A = (parts: Array<{ type: string; text?: string }>) => ({ info: { role: "assistant" }, parts });
 const U = (text: string) => ({ info: { role: "user" }, parts: [{ type: "text", text }] });

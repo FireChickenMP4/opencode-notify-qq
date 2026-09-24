@@ -30,8 +30,16 @@ Write-Output "target:          $pluginsDir"
 
 New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
 
-Copy-Item (Join-Path $repo "src\qqbot.ts") (Join-Path $srcDir "qqbot.ts") -Force
-Copy-Item (Join-Path $repo "src\config.ts") (Join-Path $srcDir "config.ts") -Force
+# Every module the plugin imports at runtime must travel with it. The plugin
+# file itself exports only NotifyQqPlugin; helpers live in src/ so opencode does
+# not mistake a named export for a plugin function.
+$modules = @(
+    "qqbot.ts", "config.ts", "sessions.ts", "task-queue.ts",
+    "deliver.ts", "bash-watch.ts", "notify-helpers.ts", "bridge.ts"
+)
+foreach ($m in $modules) {
+    Copy-Item (Join-Path $repo "src\$m") (Join-Path $srcDir $m) -Force
+}
 Copy-Item (Join-Path $repo "plugins\notify-qq.ts") (Join-Path $pluginsDir "notify-qq.ts") -Force
 Copy-Item (Join-Path $repo "src\notify-qq.ps1") (Join-Path $srcDir "notify-qq.ps1") -Force
 

@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { bridgeHash, runningBridgeIsCurrent } from "../plugins/notify-qq";
+import { bridgeHash, runningBridgeIsCurrent } from "../src/notify-helpers";
 
 let dir: string | null = null;
 function stateFile(content: string): string {

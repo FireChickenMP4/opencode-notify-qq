@@ -21,6 +21,30 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Pure helpers live in a sibling module, NOT in this file. opencode treats every
+ * named export of a `plugins/*.ts` file as a plugin function and calls it with
+ * no arguments, so an exported helper throws at load time (`text.replace is not
+ * a function`). The path differs between layouts - repo `../src`, installed
+ * `./notify-qq/` - so both are tried, like loadClient below.
+ */
+const {
+  bridgeHash,
+  runningBridgeIsCurrent,
+  pickFinalText,
+  pickFallbackText,
+  normalizeFinalText,
+} = await (async (): Promise<typeof import("../src/notify-helpers.ts")> => {
+  for (const p of ["./notify-qq/notify-helpers.ts", "../src/notify-helpers.ts"]) {
+    try {
+      return (await import(p)) as typeof import("../src/notify-helpers.ts");
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("notify-qq: cannot locate notify-helpers.ts");
+})();
+
 /** Where the auto-spawned bridge writes stdout+stderr. */
 const BRIDGE_LOG = join(HERE, "bridge.log");
 
@@ -150,33 +174,8 @@ async function ensureBridge(): Promise<void> {
   }
 }
 
-/** Content hash of the bridge entry so a rebuilt daemon can be detected. */
-export function bridgeHash(script: string): string {
-  try {
-    const hasher = new Bun.CryptoHasher("sha256");
-    hasher.update(readFileSync(script));
-    return hasher.digest("hex").slice(0, 16);
-  } catch {
-    return "";
-  }
-}
-
 function bridgeStatePath(): string {
   return process.env.OPENCODE_NOTIFY_QQ_BRIDGE_STATE || join(HERE, "bridge.state.json");
-}
-
-/** True when the recorded bridge pid is alive and was built from `hash`. */
-export async function runningBridgeIsCurrent(statePath: string, hash: string): Promise<boolean> {
-  if (!hash) return true; // cannot verify; assume fine rather than churn processes
-  try {
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as { pid?: number; hash?: string };
-    if (state.hash !== hash) return false;
-    if (!state.pid) return false;
-    process.kill(state.pid, 0); // throws if the pid is gone
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Kill the daemon named in the state file; fall back to whoever holds `port`. */
@@ -227,88 +226,6 @@ async function isPortOpen(port: number): Promise<boolean> {
   const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
   const result = await Promise.race([attempt.then(() => true).catch(() => false), timeout]);
   return result === true;
-}
-
-/**
- * Pick the turn's closing text from a message list.
- *
- * Rule: the LAST assistant message that has text and no tool part. A message
- * that calls a tool is not a conclusion, so it is skipped.
- *
- * Trailing user messages with no reply yet are skipped first. The bridge injects
- * a queued `.task` as a user message the moment the session goes idle - the same
- * moment this runs - so without the skip it hit that message, treated it as the
- * turn boundary, and returned "" (a completion push with no body).
- *
- * Exported for testing: this selection was wrong three times, so it is locked.
- */
-export function pickFinalText(
-  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
-): string {
-  let start = messages.length - 1;
-  // Skip pending trailing user turns (e.g. an injected .task not yet answered).
-  while (start >= 0 && messages[start]?.info?.role === "user") start--;
-
-  for (let i = start; i >= 0; i--) {
-    const m = messages[i]!;
-    if (m.info?.role === "user") break;
-    if (m.info?.role !== "assistant") continue;
-    const parts = m.parts ?? [];
-    if (parts.some((p) => p.type === "tool")) continue;
-    const text = parts
-      .filter((p) => p.type === "text" && p.text?.trim())
-      .map((p) => p.text!.trim())
-      .join("\n\n")
-      .trim();
-    if (text) return text;
-  }
-  return "";
-}
-
-/**
- * The most recent thing the agent actually said, even from a tool step.
- *
- * Used only when pickFinalText finds no clean conclusion: an interrupted turn
- * (the last step errored or was aborted) ends on a tool message and has no
- * text-only message at all, so the push would otherwise show no body. A short
- * "let me check X" beats a blank notification.
- *
- * Exported for testing.
- */
-export function pickFallbackText(
-  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
-): string {
-  let start = messages.length - 1;
-  while (start >= 0 && messages[start]?.info?.role === "user") start--;
-
-  for (let i = start; i >= 0; i--) {
-    const m = messages[i]!;
-    if (m.info?.role === "user") break;
-    if (m.info?.role !== "assistant") continue;
-    const texts = (m.parts ?? []).filter((p) => p.type === "text" && p.text?.trim());
-    const last = texts[texts.length - 1];
-    if (last?.text?.trim()) return last.text.trim();
-  }
-  return "";
-}
-
-/**
- * Tidy the turn's closing text for a push.
- *
- * The input is already the final text-only message, so it is complete and must
- * NOT be trimmed to a headline: an earlier 800-char cap silently cut the tail
- * off ordinary replies. QQ markdown accepts far more (verified >12k chars), so
- * `maxChars` is only a runaway guard.
- *
- * Exported for testing.
- */
-export function normalizeFinalText(text: string, maxChars: number): string {
-  const body = text
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]+$/gm, "")
-    .trim();
-  if (body.length < 4) return "";
-  return body.length > maxChars ? `${body.slice(0, Math.max(0, maxChars - 3))}...` : body;
 }
 
 export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
