@@ -58,7 +58,13 @@ function writeState(): void {
 }
 
 function log(message: string): void {
-  console.log(`[bridge] ${message}`);
+  console.log(`${new Date().toISOString()} [bridge] ${message}`);
+}
+
+/** One-line preview of a command body for the log. */
+function preview(text: string, max = 120): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -327,7 +333,7 @@ async function drainQueue(sessionID: string): Promise<void> {
     const rest = taskQueue.size(sessionID);
     const num = sessionNumbers.lookup(sessionID);
     await sendText(`开始排队任务${num !== undefined ? ` #${num}` : ""}: ${text.slice(0, 80)}`);
-    log(`command: task drained (${rest} still pending)`);
+    log(`task drained from ${sessionID} (${rest} pending): ${preview(text)}`);
   } catch (cause) {
     log(`drain failed, keeping queued: ${cause instanceof Error ? cause.message : cause}`);
   } finally {
@@ -367,7 +373,7 @@ async function runCommand(cmd: Command): Promise<void> {
       // .ask means "steer into the running turn"; prompt_async already does that.
       await prompt(target, cmd.text);
       await sendText(`已插话 ${tag}: ${cmd.text.slice(0, 80)}`);
-      log("command: ask");
+      log(`ask steered into ${target}: ${preview(cmd.text)}`);
       return;
     }
 
@@ -376,12 +382,12 @@ async function runCommand(cmd: Command): Promise<void> {
     if (await sessionIsBusy(target)) {
       const n = taskQueue.push(target, cmd.text);
       await sendText(`已排队 ${tag}（本轮结束后执行，队列 ${n} 条）: ${cmd.text.slice(0, 80)}`);
-      log(`command: task queued (${n} pending)`);
+      log(`task queued for ${target} (${n} pending): ${preview(cmd.text)}`);
       return;
     }
     await prompt(target, cmd.text);
     await sendText(`已发送 ${tag}: ${cmd.text.slice(0, 80)}`);
-    log("command: task (idle, sent now)");
+    log(`task sent now (idle) to ${target}: ${preview(cmd.text)}`);
   } catch (cause) {
     await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
   }
