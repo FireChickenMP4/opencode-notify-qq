@@ -112,17 +112,24 @@ bun run src/listen.ts 90        # 监听 90 秒
 **改完立即生效**——配置在每次事件时重新读取，不需要重启 opencode，也不需要
 agent 空闲（这正是你离开时的状态）。
 
-**为什么不做成 `/qq-on` 命令**：opencode 的自定义命令本质是发一条 prompt，
-agent 正忙时会报 `Session is busy`——而"你需要开这个开关"的时刻恰恰是 agent
-在跑的时候。所以配置字段是真正的开关，命令只是空闲时的便利入口。
+### 快捷开关（shell 函数）
 
-也有命令可用（空闲时）：
+安装脚本会往 PowerShell profile 写入一个函数（**PS 5.1 与 pwsh 7 都写**，
+因为你的交互 shell 通常是后者）：
 
-```text
-/qq-on      打开自动推送
-/qq-off     关闭
-/qq-status  查看状态
+```powershell
+notify-qq on        # 我要离开了，任务完成推我
+notify-qq off       # 回来了，别推
+notify-qq status    # 看当前状态
+notify-qq toggle    # 切换
 ```
+
+**它只改配置文件，不经过 opencode** —— 所以 agent 正忙时也能用，改完立即生效。
+
+> **为什么不做成 opencode 的 `/qq-on` 命令**：opencode 自定义命令本质是发一条
+> prompt 走 agent，忙时会报 `Session is busy`——而这恰恰是你需要开开关的时刻。
+> 而且为一个布尔值开一整轮 agent 本身就不合理。所以开关是配置文件，
+> 命令形式被废弃。
 
 agent 主动推仍随时可用（不依赖这个开关）：
 
@@ -149,6 +156,7 @@ src/
   qqbot.ts        # 官方 Bot 客户端（纯手写，REST + WSS）
   config.ts       # 配置层（密钥 + idleNotify 开关，不进仓库）
   config.test.ts  # 配置层单测
+  notify-qq.ps1   # 快捷开关 CLI（on/off/status/toggle）
   notify.ts       # 推送 / 校验 CLI
   listen.ts       # 有界监听（抓 openid、调试事件）
 plugins/

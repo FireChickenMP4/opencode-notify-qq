@@ -8,8 +8,8 @@
  *
  * The idle switch lives in the config file and is read FRESH on every event,
  * so flipping it in the JSON takes effect immediately - no restart, and it
- * works while the agent is busy (a `/qq-on` command would need an idle session,
- * which is exactly when you don't need it).
+ * works while the agent is busy. A `notify-qq on|off` shell function is
+ * installed for convenience (see install.ps1 / README).
  *
  * Setup: credentials + switch in ~/.config/opencode/notify-qq.json (see README).
  */
@@ -97,25 +97,6 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   return {
-    config: async (config) => {
-      config.command ??= {};
-      config.command["qq-on"] ??= {
-        description: "Enable QQ push when a turn finishes",
-        template:
-          "Call the qq_switch tool with enabled=true, then confirm the new state briefly. " +
-          "If the call fails, tell the user to edit ~/.config/opencode/notify-qq.json directly.",
-      };
-      config.command["qq-off"] ??= {
-        description: "Disable QQ push when a turn finishes",
-        template:
-          "Call the qq_switch tool with enabled=false, then confirm the new state briefly.",
-      };
-      config.command["qq-status"] ??= {
-        description: "Show QQ notification status",
-        template: "Call the qq_switch tool with status=true and report the result.",
-      };
-    },
-
     event: async ({ event }) => {
       // V2 signals "done" via session.status with status.type === "idle".
       if (event.type !== "session.status") return;
