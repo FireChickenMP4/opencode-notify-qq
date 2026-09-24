@@ -223,15 +223,23 @@ async function isPortOpen(port: number): Promise<boolean> {
  * Pick the turn's closing text from a message list.
  *
  * Rule: the LAST assistant message that has text and no tool part. A message
- * that calls a tool is not a conclusion, so it is skipped. Walking stops at the
- * first user message (turn boundary).
+ * that calls a tool is not a conclusion, so it is skipped.
  *
- * Exported for testing: this selection was wrong twice, so it is locked down.
+ * Trailing user messages with no reply yet are skipped first. The bridge injects
+ * a queued `.task` as a user message the moment the session goes idle - the same
+ * moment this runs - so without the skip it hit that message, treated it as the
+ * turn boundary, and returned "" (a completion push with no body).
+ *
+ * Exported for testing: this selection was wrong three times, so it is locked.
  */
 export function pickFinalText(
   messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
 ): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
+  let start = messages.length - 1;
+  // Skip pending trailing user turns (e.g. an injected .task not yet answered).
+  while (start >= 0 && messages[start]?.info?.role === "user") start--;
+
+  for (let i = start; i >= 0; i--) {
     const m = messages[i]!;
     if (m.info?.role === "user") break;
     if (m.info?.role !== "assistant") continue;

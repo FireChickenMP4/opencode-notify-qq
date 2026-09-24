@@ -1,9 +1,10 @@
 /**
  * Turn-final text selection.
  *
- * This was wrong twice: first "last message with text" (grabbed a tool-step
- * preamble), then "collect and truncate" (produced a 前略 marker). The rule is
- * now "last assistant message with text and NO tool part", locked here.
+ * This was wrong three times: "last message with text" (grabbed a tool-step
+ * preamble), "collect and truncate" (produced a 前略 marker), and not skipping
+ * a trailing injected `.task` (returned "" right at idle). The rule is now "skip
+ * pending trailing user turns, then the last text-only assistant message".
  */
 
 import { describe, expect, test } from "bun:test";
@@ -41,6 +42,27 @@ describe("pickFinalText", () => {
     expect(pickFinalText(msgs)).toBe("");
   });
 
+  test("ignores a trailing injected .task (idle race)", () => {
+    // The bridge injects the queued task as a user message the moment the
+    // session goes idle; the completion push must still show the prior reply.
+    const msgs = [
+      U("earlier work"),
+      A([{ type: "text", text: "the previous turn's answer" }]),
+      U(".task do the next thing"), // injected, not yet answered
+    ];
+    expect(pickFinalText(msgs)).toBe("the previous turn's answer");
+  });
+
+  test("ignores several trailing unreplied user messages", () => {
+    const msgs = [
+      U("old"),
+      A([{ type: "text", text: "answer" }]),
+      U("injected 1"),
+      U("injected 2"),
+    ];
+    expect(pickFinalText(msgs)).toBe("answer");
+  });
+
   test("joins multiple text parts of the chosen message", () => {
     const msgs = [U("x"), A([{ type: "text", text: "part1" }, { type: "text", text: "part2" }])];
     expect(pickFinalText(msgs)).toBe("part1\n\npart2");
@@ -53,5 +75,9 @@ describe("pickFinalText", () => {
   test("ignores blank-only text", () => {
     const msgs = [U("x"), A([{ type: "text", text: "   " }])];
     expect(pickFinalText(msgs)).toBe("");
+  });
+
+  test("all-user input yields empty", () => {
+    expect(pickFinalText([U("a"), U("b")])).toBe("");
   });
 });
