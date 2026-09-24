@@ -144,6 +144,49 @@ export async function sendText(
   return body;
 }
 
+/**
+ * Send a markdown message (msg_type 2).
+ *
+ * Custom markdown is available to every bot in c2c and group chats since
+ * 2026/04/23, no template approval needed. Supported: headings, bold, italic,
+ * strikethrough, links, ordered/unordered lists, blockquote, hr.
+ * Falls back to plain text on failure so a notification is never lost to
+ * formatting.
+ */
+export async function sendMarkdown(
+  content: string,
+  options: { target?: NotifyTarget; msgId?: string; msgSeq?: number } = {},
+): Promise<SendResult> {
+  const cfg = requireConfig();
+  const target = options.target ?? cfg.notifyTarget;
+  if (!target) {
+    throw new QqBotError("no notifyTarget configured (c2c.openid or group.groupOpenid)");
+  }
+
+  try {
+    const token = await getAccessToken();
+    const res = await fetch(`${apiBase(cfg.sandbox)}${targetPath(target)}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `QQBot ${token}`,
+      },
+      body: JSON.stringify({
+        markdown: { content },
+        msg_type: 2,
+        ...(options.msgId ? { msg_id: options.msgId } : {}),
+        msg_seq: options.msgSeq ?? 1,
+      }),
+    });
+    const body = (await res.json()) as SendResult & { code?: number; message?: string };
+    if (res.ok && !body.code) return body;
+    throw new QqBotError(body.message ?? `HTTP ${res.status}`, body.code);
+  } catch {
+    // Strip markdown syntax and re-send as plain text.
+    return sendText(content.replace(/\*\*|__|[*_~`#]/g, "").replace(/\n{3,}/g, "\n\n"), options);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WSS 长连接
 // ---------------------------------------------------------------------------

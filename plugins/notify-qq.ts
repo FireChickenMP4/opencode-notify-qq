@@ -40,12 +40,13 @@ function trace(line: string): void {
   }
 }
 
-type Client = {
-  sendText: (m: string) => Promise<{ id?: string }>;
-  configPath: () => string;
-  loadConfig: () => { qqbot?: { notifyTarget?: unknown }; awayNotify: boolean };
-  setAwayNotify: (enabled: boolean) => boolean;
-};
+  type Client = {
+    sendText: (m: string) => Promise<{ id?: string }>;
+    sendMarkdown: (m: string) => Promise<{ id?: string }>;
+    configPath: () => string;
+    loadConfig: () => { qqbot?: { notifyTarget?: unknown }; awayNotify: boolean };
+    setAwayNotify: (enabled: boolean) => boolean;
+  };
 
 // The client sources sit next to this file once installed as
 // `plugins/notify-qq.ts` + `plugins/notify-qq/`. In the repo they live under
@@ -58,6 +59,7 @@ async function loadClient(): Promise<Client> {
       const config = await import(qqbotPath.replace("qqbot.ts", "config.ts"));
       return {
         sendText: qqbot.sendText,
+        sendMarkdown: qqbot.sendMarkdown,
         configPath: config.configPath,
         loadConfig: config.loadConfig,
         setAwayNotify: config.setAwayNotify,
@@ -161,13 +163,13 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     .catch(() => {});
 
   /** Send, swallowing errors so a notification never breaks a session. */
-  async function trySend(text: string): Promise<string> {
+  async function trySend(text: string, markdown = false): Promise<string> {
     if (!api) {
       trace(`send skipped: api not loaded (${loadError})`);
       return `notify_qq unavailable: ${loadError}`;
     }
     try {
-      const result = await api.sendText(text);
+      const result = markdown ? await api.sendMarkdown(text) : await api.sendText(text);
       trace(`sent: ${text}`);
       return `sent to QQ (id=${result.id ?? "?"})`;
     } catch (cause) {
@@ -258,10 +260,23 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     }
   }
 
-  /** One-line headline for a push: collapse whitespace, cap length. */
+  /**
+   * A short headline for a push.
+   *
+   * The last assistant message is often a long multi-section reply; pasting all
+   * of it into a QQ notification is unreadable. Take the LAST paragraph (usually
+   * the wrap-up line) and cap it. Returns "" when nothing usable.
+   */
   function headline(text: string): string {
-    const flat = text.replace(/\s+/g, " ").trim();
-    return flat.length > 160 ? `${flat.slice(0, 157)}...` : flat;
+    const paragraphs = text
+      .split(/\n{2,}/)
+      .map((p) => p.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const last = paragraphs.at(-1) ?? "";
+    // A final paragraph that is mostly markdown furniture is not a summary.
+    const cleaned = last.replace(/^[#>\-*\s]+/, "").trim();
+    if (cleaned.length < 8) return "";
+    return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
   }
 
   return {
@@ -319,7 +334,12 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       // Disable with OPENCODE_NOTIFY_QQ_SUMMARY=0 for the old bare message.
       const wantSummary = process.env.OPENCODE_NOTIFY_QQ_SUMMARY !== "0";
       const summary = wantSummary && props.sessionID ? headline(await lastAssistantText(props.sessionID)) : "";
-      await trySend(summary ? `opencode · 完成 [${workspace}]\n${summary}` : `opencode · 完成 [${workspace}]`);
+      // Markdown so the heading and body render instead of collapsing into one
+      // run-on line.
+      const md = summary
+        ? `**opencode · 完成**\n\n\`${workspace}\`\n\n---\n\n${summary}`
+        : `**opencode · 完成**\n\n\`${workspace}\``;
+      await trySend(md, true);
     },
 
     tool: {
