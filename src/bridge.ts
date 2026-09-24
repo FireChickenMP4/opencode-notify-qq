@@ -17,7 +17,7 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "./config";
-import { QqBotClient, getAccessToken, sendText, type GatewayEvent } from "./qqbot";
+import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
 
 const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096").replace(
   /\/$/,
@@ -66,13 +66,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 
 type OpencodeEvent = { id?: string; type?: string; properties?: Record<string, unknown> };
-type Session = { id: string; directory?: string };
+type Session = { id: string; directory?: string; agent?: string };
 
 let sessions: Session[] | null = null;
 let sessionsAt = 0;
 
 /** Session list changes rarely; cache it so each permission is one round-trip. */
-async function sessionDirectory(sessionID: string): Promise<string> {
+async function sessionInfo(sessionID: string): Promise<Session> {
   if (!sessions || Date.now() - sessionsAt > 60_000) {
     const res = await fetch(`${BASE}/session`);
     if (res.ok) {
@@ -80,7 +80,11 @@ async function sessionDirectory(sessionID: string): Promise<string> {
       sessionsAt = Date.now();
     }
   }
-  return sessions?.find((s) => s.id === sessionID)?.directory ?? "(unknown)";
+  return sessions?.find((s) => s.id === sessionID) ?? { id: sessionID };
+}
+
+async function sessionDirectory(sessionID: string): Promise<string> {
+  return (await sessionInfo(sessionID)).directory ?? "(unknown)";
 }
 
 // ---------------------------------------------------------------------------
@@ -219,18 +223,25 @@ export function promptPath(sessionID: string): string {
 
 /**
  * Inject a message into a session via `promptPath`.
+ *
+ * The session's own agent is passed explicitly. opencode would otherwise fall
+ * back to the last user message's agent (or the default "build"), which means a
+ * `.task` into a "yolo" session could suddenly start asking for permissions.
+ * Reusing the session's agent keeps the run in the mode you were already in.
  */
 async function prompt(sessionID: string, text: string): Promise<void> {
+  const agent = (await sessionInfo(sessionID)).agent;
+  const payload = { parts: [{ type: "text", text }], ...(agent ? { agent } : {}) };
   const res = await fetch(`${BASE}${promptPath(sessionID)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ parts: [{ type: "text", text }] }),
+    body: JSON.stringify(payload),
   });
   if (res.ok) return;
   const fallback = await fetch(`${BASE}/session/${sessionID}/message`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ parts: [{ type: "text", text }] }),
+    body: JSON.stringify(payload),
   });
   if (!fallback.ok) throw new Error(`HTTP ${res.status} then ${fallback.status}`);
 }
@@ -240,6 +251,53 @@ const CONFIRM: Record<Verdict, string> = {
   always: "已批准 always(记住)",
   reject: "已拒绝 reject",
 };
+
+/**
+ * Render a permission request for QQ.
+ *
+ * QQ markdown has no code-block rendering for the shapes we tried, but it does
+ * render fenced blocks with a language (verified: ` ```sh ` gets a block+highlight).
+ * A raw bash command dumped as one line is unreadable on a phone, so the command
+ * goes into a fenced block.
+ *
+ * For external_directory the command is NOT the point - what you are granting is
+ * the DIRECTORY. The plain `patterns` line tells you the exact scope that
+ * "always" will remember, which a command cannot convey.
+ *
+ * Pure and exported so the layout is testable.
+ */
+export function formatPermission(
+  directory: string,
+  permission: string,
+  metadata: Record<string, unknown>,
+  patterns: string[],
+): string {
+  const lines = [`**需要授权**`, `目录: \`${directory}\``, `工具: **${permission}**`];
+
+  if (permission === "external_directory") {
+    const dirs = Array.isArray(metadata.directories) ? metadata.directories.map(String) : [];
+    const command = typeof metadata.command === "string" ? metadata.command : "";
+    if (dirs.length) {
+      lines.push("", "访问目录:");
+      for (const d of dirs) lines.push(`- \`${d}\``);
+    }
+    if (patterns.length) {
+      lines.push("", "记住(always)范围:");
+      for (const p of patterns) lines.push(`- \`${p}\``);
+    }
+    if (command) lines.push("", "命令:", "```sh", command.trim(), "```");
+  } else {
+    const command =
+      (typeof metadata.command === "string" && metadata.command) ||
+      (typeof metadata.filePath === "string" && metadata.filePath) ||
+      (typeof metadata.filepath === "string" && metadata.filepath) ||
+      (patterns.length ? patterns.join(" ") : "(no detail)");
+    lines.push("", "```sh", String(command).trim(), "```");
+  }
+
+  lines.push("", "回复  **.o**=once  **.a**=always(记住)  **.r**=reject");
+  return lines.join("\n");
+}
 
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
@@ -257,28 +315,11 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
     const patterns = Array.isArray(p.patterns) ? p.patterns.map(String) : [];
     const metadata = (p.metadata ?? {}) as Record<string, unknown>;
 
-    // Which detail matters depends on the permission kind. Measured payloads:
-    //   bash               -> metadata.command      (the command itself)
-    //   external_directory -> metadata.filepath     (what it wants to touch)
-    //   edit/write/read    -> metadata.filePath
-    // patterns is the fallback (the always-allow globs).
-    const detail = [
-      metadata.command,
-      metadata.filepath,
-      metadata.filePath,
-      patterns.length ? patterns.join(" ") : undefined,
-    ].find((v) => typeof v === "string" && v.trim()) ?? "(no detail)";
-
     const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
     const directory = await sessionDirectory(sessionID);
 
     pending.set(requestID, { requestID, sessionID, permission });
-    await sendText(
-      `【需要授权】${directory}\n` +
-        `工具: ${permission}\n` +
-        `内容: ${String(detail).trim()}\n` +
-        `回复 .o=once  .a=always(记住)  .r=reject`,
-    );
+    await sendMarkdown(formatPermission(directory, permission, metadata, patterns));
     log(`permission ${requestID} (${permission}) -> QQ`);
   } catch (cause) {
     log(`failed to handle permission: ${cause instanceof Error ? cause.message : cause}`);
