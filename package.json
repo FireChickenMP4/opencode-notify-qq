@@ -7,7 +7,8 @@
   "scripts": {
     "check": "bun run src/notify.ts --check",
     "send": "bun run src/notify.ts",
-    "listen": "bun run src/listen.ts"
+    "listen": "bun run src/listen.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.15.13",

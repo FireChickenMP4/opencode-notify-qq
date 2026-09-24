@@ -41,6 +41,9 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
       "type": "c2c",
       "openid": "你的 openid"
     }
+  },
+  "idleNotify": {
+    "enabled": false
   }
 }
 ```
@@ -51,6 +54,7 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
 | `sandbox` | 沙箱环境填 `true`（域名与凭据都不同） |
 | `notifyTarget.type` | `c2c`（单聊）或 `group`（群聊） |
 | `notifyTarget.openid` | `c2c` 用；`group` 时改用 `groupOpenid` |
+| `idleNotify.enabled` | 回合结束时**自动**推 QQ。**默认 false** |
 
 > 这个文件含密钥，**永远不要提交**。它不在任何仓库里。
 
@@ -90,9 +94,37 @@ bun run src/listen.ts 90        # 监听 90 秒
 
 ## 用法
 
-### agent 主动推（主要用法）
+### 两种触发方式
 
-agent 会自己判断时机调用 `notify_qq`。你也可以直接要求：
+| 方式 | 触发 | 默认 |
+|---|---|---|
+| **agent 主动推** | agent 判断该通知你时调 `notify_qq` | 开 |
+| **回合结束自动推** | 每次回合结束 | **关** |
+
+### 我想离开电脑，等任务完成通知我
+
+打开 `idleNotify.enabled`，之后每次回合结束都会推 QQ：
+
+```json
+{ "idleNotify": { "enabled": true } }
+```
+
+**改完立即生效**——配置在每次事件时重新读取，不需要重启 opencode，也不需要
+agent 空闲（这正是你离开时的状态）。
+
+**为什么不做成 `/qq-on` 命令**：opencode 的自定义命令本质是发一条 prompt，
+agent 正忙时会报 `Session is busy`——而"你需要开这个开关"的时刻恰恰是 agent
+在跑的时候。所以配置字段是真正的开关，命令只是空闲时的便利入口。
+
+也有命令可用（空闲时）：
+
+```text
+/qq-on      打开自动推送
+/qq-off     关闭
+/qq-status  查看状态
+```
+
+agent 主动推仍随时可用（不依赖这个开关）：
 
 > 我先去吃饭了，跑完通知我
 
@@ -114,14 +146,15 @@ bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 
 ```text
 src/
-  qqbot.ts     # 官方 Bot 客户端（纯手写，REST + WSS）
-  config.ts    # 配置层（密钥不进仓库）
-  notify.ts    # 推送 / 校验 CLI
-  listen.ts    # 有界监听（抓 openid、调试事件）
+  qqbot.ts        # 官方 Bot 客户端（纯手写，REST + WSS）
+  config.ts       # 配置层（密钥 + idleNotify 开关，不进仓库）
+  config.test.ts  # 配置层单测
+  notify.ts       # 推送 / 校验 CLI
+  listen.ts       # 有界监听（抓 openid、调试事件）
 plugins/
-  notify-qq.ts # opencode plugin：注册 notify_qq 工具
-install.ps1    # 一键安装
-PLAN.md        # 设计取舍与后续规划
+  notify-qq.ts    # opencode plugin：notify_qq 工具 + idle 钩子 + 命令
+install.ps1       # 一键安装
+PLAN.md           # 设计取舍与后续规划
 ```
 
 ## License

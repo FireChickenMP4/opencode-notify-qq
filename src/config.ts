@@ -20,7 +20,7 @@
  *   }
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -39,7 +39,19 @@ export type QqBotConfig = {
 
 export type NotifyConfig = {
   qqbot?: QqBotConfig;
+  /**
+   * Auto-push QQ when a turn finishes (the "I'm away, ping me when it's done"
+   * case). Off by default: enabling it means every finished turn pings your
+   * phone, which is only wanted while you are actually away.
+   *
+   * Read fresh on every event, so flipping the value in the JSON file takes
+   * effect without restarting opencode.
+   */
+  idleNotify: boolean;
 };
+
+/** Default: idle notifications are OFF. */
+export const IDLE_NOTIFY_DEFAULT = false;
 
 export function defaultConfigPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -95,5 +107,31 @@ export function loadConfig(path = configPath()): NotifyConfig {
     }
   }
   const qqbot = parseQqBot(raw.qqbot);
-  return { ...(qqbot ? { qqbot } : {}) };
+
+  // Accept either a boolean or { enabled: boolean } so the file reads naturally
+  // whichever shape the user writes.
+  let idleNotify = IDLE_NOTIFY_DEFAULT;
+  const rawIdle = raw.idleNotify;
+  if (typeof rawIdle === "boolean") {
+    idleNotify = rawIdle;
+  } else if (rawIdle && typeof rawIdle === "object") {
+    const enabled = (rawIdle as Raw).enabled;
+    if (typeof enabled === "boolean") idleNotify = enabled;
+  }
+
+  return { ...(qqbot ? { qqbot } : {}), idleNotify };
+}
+
+/**
+ * Flip the idle-notify switch in the config file, preserving everything else.
+ * Returns the new value. Used by the /qq-on and /qq-off commands.
+ */
+export function setIdleNotify(enabled: boolean, path = configPath()): boolean {
+  let raw: Raw = {};
+  if (existsSync(path)) {
+    raw = JSON.parse(readFileSync(path, "utf8")) as Raw;
+  }
+  raw.idleNotify = { enabled };
+  writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+  return enabled;
 }
