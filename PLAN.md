@@ -66,8 +66,13 @@
 - [x] 有界监听（`src/listen.ts`）：抓 openid、调试事件
 - [x] plugin（`plugins/notify-qq.ts`）：注册 `notify_qq` 工具
 - [x] 安装脚本（`install.ps1`）
+- [x] **bridge 远程审批**（SSE + QQ，单例锁端口 + 插件自动拉起）
+- [x] **子代理结束默认不通知**（带标题，`OPENCODE_NOTIFY_SUBAGENT=1` 开启）
+- [x] **回合结束带本轮总结**（读 transcript 的最后一段助手文本，不额外调模型）
+- [x] **指令集** `.task` / `.ask` / `.stop` / `.restart`
 
-已验证：`--check` 拿到 token、网关连接成功（READY 收到）、QQ 实际收到消息。
+已验证：token、网关连接、QQ 收发、真实权限请求的 `once/always/reject`、
+`delivery=queue/steer`、`abort`、单例锁拒绝第二个 bridge。
 
 ---
 
@@ -173,9 +178,21 @@ bridge 必须单例的原因。
 
 ### 4.8 分阶段
 
-1. **远程审批**（本次）—— 最刚需
-2. 每轮总结
-3. `.task` / `.ask` / `.stop` / `.restart`
+1. ~~远程审批~~ ✅
+2. ~~每轮总结~~ ✅（读 transcript 最后一段助手文本，不调 `/summarize`）
+3. ~~`.task` / `.ask` / `.stop` / `.restart`~~ ✅
+
+### 4.9 指令细节
+
+| 指令 | 端点 | 说明 |
+|---|---|---|
+| `.task <内容>` | `POST /api/session/{id}/prompt` `delivery:"queue"` | 排队，本轮结束后执行 |
+| `.ask <内容>` | 同上 `delivery:"steer"` | 立即插话；会话空闲时与 `.task` 等效 |
+| `.stop` | `POST /session/{id}/abort` | 中断当前执行 |
+| `.restart` | `abort` + 发续跑 prompt | 重启工作流 |
+
+**目标会话**：bridge 记录**最近一次见过的 sessionID**（从 permission 事件）。
+多会话时若要显式指定，留待后续（加 `#<短id>` 前缀）。
 
 ---
 

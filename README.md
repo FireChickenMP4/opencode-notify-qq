@@ -204,10 +204,36 @@ bun run src/bridge.ts --check      # 验证配置 + 凭据 + server 可达
 
 多个请求挂起时按**先到先处理**（FIFO），避免 `o` 指向不明。
 
-> **`reject` 之后**：opencode 自行决定后续（这不在我们控制内）。要继续就发 `.task`（后续阶段）。
+> **`reject` 之后**：opencode 自行决定后续（这不在我们控制内）。要继续就发 `.task`。
 
 > **为什么 bridge 必须单例**：QQ 的 WSS 同一 appId+shard 多开会互踢
 > （`op 9 Invalid Session`）。所以只能有一个进程持有连接，其余全走 HTTP。
+
+### 远程指令
+
+QQ 发以 `.` 开头的消息：
+
+| 指令 | 效果 |
+|---|---|
+| `.task <内容>` | 派任务，**排队到本轮结束**（`delivery:"queue"`） |
+| `.ask <内容>` | 立即插话（`delivery:"steer"`）；会话空闲时与 `.task` 等效 |
+| `.stop` | 中断当前执行（`abort`），最高优先级 |
+| `.restart` | 中断并让 agent 重新陈述计划、继续 |
+
+**目标会话**：bridge 用**最近一次收到权限事件的会话**。多会话时如需显式指定，
+先加 `#<会话短id>`（待实现）。
+
+### 回合结束的总结
+
+开着 `awayNotify` 时，完成通知不再是干巴巴的"完成"，而是带**本轮最后一段助手输出**：
+
+```text
+opencode · 完成 [D:\Desktop\workflow]
+重构完成：拆出 config 层，QQ 通知改为每次读配置，20 个单测通过。
+```
+
+实现上**读现有 transcript**，不调 `POST /session/{id}/summarize` —— 后者要再跑一轮
+模型，慢且花钱，而我们只想要个标题。`OPENCODE_NOTIFY_QQ_SUMMARY=0` 可退回纯"完成"。
 
 ---
 
@@ -221,6 +247,7 @@ bun run src/bridge.ts --check      # 验证配置 + 凭据 + server 可达
 | `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
 | `OPENCODE_NOTIFY_QQ_LOCK_PORT` | `4097` | bridge 单例锁端口 |
 | `OPENCODE_NOTIFY_QQ_BRIDGE` | `1` | 设 `0` 不自动拉起 bridge |
+| `OPENCODE_NOTIFY_QQ_SUMMARY` | `1` | 设 `0` 完成通知不带总结 |
 | `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
 
 事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录每个

@@ -224,6 +224,40 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     return title.replace(/\s*\(@\w+\s+subagent\)\s*$/i, "").trim().slice(0, 60) || "子代理";
   }
 
+  /**
+   * Last assistant text of a session, used as the end-of-turn summary.
+   *
+   * Reads the existing transcript instead of calling /summarize: that endpoint
+   * runs another model turn (slow, costs tokens) just to say what the agent
+   * already wrote. We only want a headline for the push.
+   */
+  async function lastAssistantText(sessionID: string): Promise<string> {
+    try {
+      const res = await client.session.messages({ path: { id: sessionID } });
+      const messages = (res as { data?: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }> }).data;
+      if (!Array.isArray(messages)) return "";
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]!;
+        if (m.info?.role !== "assistant") continue;
+        const text = (m.parts ?? [])
+          .filter((p) => p.type === "text" && p.text)
+          .map((p) => p.text!.trim())
+          .join(" ")
+          .trim();
+        if (text) return text;
+      }
+      return "";
+    } catch {
+      return "";
+    }
+  }
+
+  /** One-line headline for a push: collapse whitespace, cap length. */
+  function headline(text: string): string {
+    const flat = text.replace(/\s+/g, " ").trim();
+    return flat.length > 160 ? `${flat.slice(0, 157)}...` : flat;
+  }
+
   return {
     event: async ({ event }) => {
       const type = event.type;
@@ -274,7 +308,12 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
         trace("idle skipped: dedup");
         return;
       }
-      await trySend(`opencode · 完成 [${workspace}]`);
+
+      // Include a headline so the push says WHAT finished, not just "done".
+      // Disable with OPENCODE_NOTIFY_QQ_SUMMARY=0 for the old bare message.
+      const wantSummary = process.env.OPENCODE_NOTIFY_QQ_SUMMARY !== "0";
+      const summary = wantSummary && props.sessionID ? headline(await lastAssistantText(props.sessionID)) : "";
+      await trySend(summary ? `opencode · 完成 [${workspace}]\n${summary}` : `opencode · 完成 [${workspace}]`);
     },
 
     tool: {

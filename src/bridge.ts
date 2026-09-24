@@ -95,6 +95,85 @@ export function parseReply(text: string): Verdict | undefined {
   return REPLY_ALIASES[key];
 }
 
+// ---------------------------------------------------------------------------
+// Remote commands
+// ---------------------------------------------------------------------------
+
+export type Command =
+  | { kind: "task" | "ask"; text: string }
+  | { kind: "stop" }
+  | { kind: "restart" };
+
+/**
+ * Parse a leading-dot command. Returns undefined for anything else, so ordinary
+ * chatter and o/a/r replies pass through untouched.
+ *
+ *   .task <text>     queue a task; runs after the current turn
+ *   .ask  <text>     light interjection; steers immediately; same as .task when idle
+ *   .stop            abort the running turn (highest priority)
+ *   .restart         restart the session's agent loop (abort + continue)
+ */
+export function parseCommand(text: string): Command | undefined {
+  const m = text.trim().match(/^[.．]\s*(task|ask|stop|restart)\b\s*([\s\S]*)$/i);
+  if (!m) return undefined;
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop" | "restart";
+  const rest = (m[2] ?? "").trim();
+  if (kind === "stop" || kind === "restart") return { kind };
+  if (!rest) return undefined; // a bare ".task" with no body is not a command
+  return { kind, text: rest };
+}
+
+/** The session a command should act on: the most recent one we have seen. */
+let lastSessionID: string | null = null;
+
+async function runCommand(cmd: Command): Promise<void> {
+  if (!lastSessionID) {
+    await sendText(`没有已知会话，无法执行 .${cmd.kind}`);
+    return;
+  }
+  try {
+    if (cmd.kind === "stop") {
+      await fetch(`${BASE}/session/${lastSessionID}/abort`, { method: "POST" });
+      await sendText("已中断当前执行");
+      log("command: stop");
+      return;
+    }
+
+    if (cmd.kind === "restart") {
+      // No dedicated endpoint; abort then send a continuation prompt.
+      await fetch(`${BASE}/session/${lastSessionID}/abort`, { method: "POST" });
+      await sendText("已中断，正在重启工作流");
+      await prompt(lastSessionID, "Continue from where you left off. Re-state the plan and resume.");
+      log("command: restart");
+      return;
+    }
+
+    // task = queue for after this turn; ask = steer into it now.
+    await prompt(lastSessionID, cmd.text, cmd.kind === "task" ? "queue" : "steer");
+    await sendText(`已${cmd.kind === "task" ? "排队" : "插话"}: ${cmd.text.slice(0, 80)}`);
+    log(`command: ${cmd.kind}`);
+  } catch (cause) {
+    await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
+  }
+}
+
+/** Inject a prompt into a session. `delivery` decides queue-vs-steer. */
+async function prompt(sessionID: string, text: string, delivery?: "queue" | "steer"): Promise<void> {
+  const res = await fetch(`${BASE}/api/session/${sessionID}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: { text }, ...(delivery ? { delivery } : {}) }),
+  });
+  // Older builds lack /api/session/{id}/prompt; fall back to the v1 route.
+  if (res.ok) return;
+  const fallback = await fetch(`${BASE}/session/${sessionID}/message`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ parts: [{ type: "text", text }] }),
+  });
+  if (!fallback.ok) throw new Error(`HTTP ${res.status} then ${fallback.status}`);
+}
+
 const CONFIRM: Record<Verdict, string> = {
   once: "已批准 once",
   always: "已批准 always(记住)",
@@ -126,6 +205,7 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
     const directory = await sessionDirectory(sessionID);
+    if (sessionID) lastSessionID = sessionID;
 
     pending.set(requestID, { requestID, sessionID, permission });
     await sendText(
@@ -144,9 +224,17 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
   try {
     if (event.t !== "C2C_MESSAGE_CREATE" && event.t !== "GROUP_AT_MESSAGE_CREATE") return;
     const content = (event.d as { content?: string } | undefined)?.content ?? "";
+
+    // Commands (.task / .ask / .stop / .restart) are checked first: their
+    // leading word makes them unambiguous against the o/a/r replies.
+    const command = parseCommand(content);
+    if (command) {
+      await runCommand(command);
+      return;
+    }
+
     const reply = parseReply(content);
-    // Not a control reply: `.task` and friends are handled later. Stay silent.
-    if (!reply) return;
+    if (!reply) return; // unrelated chatter; stay silent
 
     // FIFO: with several requests waiting, "o" must mean one unambiguous one.
     const target = pending.values().next().value as Pending | undefined;
