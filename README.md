@@ -101,6 +101,9 @@ bun run src/listen.ts 90        # 监听 90 秒
 | **agent 主动推** | agent 判断该通知你时调 `notify_qq` | 开 |
 | **离开时自动推** | 回合结束 **或** 有权限请求在等你 | **关** |
 
+> **子代理结束默认不通知**：子代理结束时主会话仍在跑，报"完成"是误导。
+> `OPENCODE_NOTIFY_SUBAGENT=1` 可开启，标题为 `opencode · 子代理完成 [标题]`。
+
 ### 我要离开电脑，需要时叫我
 
 打开 `awayNotify.enabled`：
@@ -204,6 +207,7 @@ bun run src/bridge.ts
 | `NOTIFY_QQ_CONFIG` | `~/.config/opencode/notify-qq.json` | 配置路径 |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4096` | bridge 连的 opencode server |
 | `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口 |
+| `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
 | `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
 
 事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录每个
@@ -226,6 +230,7 @@ src/
   notify.ts       # 推送 / 校验 CLI
   listen.ts       # 有界监听（抓 openid、调试事件）
   bridge.ts       # 远程审批 daemon（SSE + QQ，单例）
+  bridge.test.ts  # 回复解析单测
 plugins/
   notify-qq.ts    # opencode plugin：notify_qq 工具 + idle 钩子 + 命令
 install.ps1       # 一键安装

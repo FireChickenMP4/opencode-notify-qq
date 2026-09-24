@@ -140,6 +140,30 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     return true;
   }
 
+  type SessionInfo = { parentID?: string; title?: string };
+  const sessionCache = new Map<string, SessionInfo>();
+
+  /** Resolve whether a session is a subagent, and its title. */
+  async function sessionInfo(sessionID: string): Promise<SessionInfo> {
+    const cached = sessionCache.get(sessionID);
+    if (cached) return cached;
+    try {
+      const res = await client.session.get({ path: { id: sessionID } });
+      const data = (res as { data?: SessionInfo }).data;
+      const info: SessionInfo = { parentID: data?.parentID, title: data?.title };
+      sessionCache.set(sessionID, info);
+      return info;
+    } catch {
+      return {};
+    }
+  }
+
+  /** Drop the "(@general subagent)" tail and cap length. */
+  function shortTitle(title: string | undefined): string {
+    if (!title) return "子代理";
+    return title.replace(/\s*\(@\w+\s+subagent\)\s*$/i, "").trim().slice(0, 60) || "子代理";
+  }
+
   return {
     event: async ({ event }) => {
       const type = event.type;
@@ -163,8 +187,25 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       }
 
       // V2 signals "done" via session.status with status.type === "idle".
-      const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
-      if (status?.type !== "idle") return;
+      const props = (event as { properties?: { sessionID?: string; status?: { type?: string } } }).properties;
+      if (props?.status?.type !== "idle") return;
+
+      // Subagents finish while the main session keeps working; reporting them
+      // as "done" is misleading and noisy. Off unless explicitly enabled.
+      if (props.sessionID) {
+        const info = await sessionInfo(props.sessionID);
+        if (info.parentID) {
+          if (process.env.OPENCODE_NOTIFY_SUBAGENT !== "1") {
+            trace(`idle skipped: subagent (${shortTitle(info.title)})`);
+            return;
+          }
+          if (!awayEnabled()) return;
+          if (!shouldSend("subagent")) return;
+          await trySend(`opencode · 子代理完成 [${shortTitle(info.title)}]`);
+          return;
+        }
+      }
+
       if (!awayEnabled()) {
         trace("idle skipped: awayNotify is off");
         return;
