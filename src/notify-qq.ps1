@@ -1,8 +1,11 @@
 ﻿# Read or change the idle-notify switch from the shell.
 #
-#   notify-qq            -> show status
-#   notify-qq on         -> enable (ping me when a turn finishes)
-#   notify-qq off        -> disable
+#   notify-qq              -> show status
+#   notify-qq on           -> enable (ping me when a turn finishes)
+#   notify-qq off          -> disable
+#   notify-qq toggle       -> flip
+#   notify-qq serve        -> ensure `opencode serve` is running (idempotent)
+#   notify-qq serve-stop   -> stop it
 #
 # Works while opencode is running: the plugin re-reads the config on every
 # event, so the change takes effect immediately. Nothing here talks to opencode.
@@ -12,6 +15,40 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# --- server management belongs here so the user has one entry point ---------
+$servePort = if ($env:OPENCODE_NOTIFY_QQ_SERVE_PORT) { [int]$env:OPENCODE_NOTIFY_QQ_SERVE_PORT } else { 4096 }
+
+function Test-Port([int]$Port) {
+    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+
+switch ($Action.ToLower()) {
+    "serve" {
+        if (Test-Port $servePort) {
+            Write-Output "opencode serve already running on port $servePort"
+            exit 0
+        }
+        $exe = (Get-Command opencode -ErrorAction SilentlyContinue).Source
+        if (-not $exe) { Write-Output "opencode not found on PATH"; exit 1 }
+        Start-Process -FilePath $exe -ArgumentList "serve", "--port", "$servePort" -WindowStyle Hidden | Out-Null
+        Start-Sleep -Seconds 6
+        if (Test-Port $servePort) {
+            Write-Output "opencode serve started on port $servePort"
+            Write-Output "now attach with: opencode attach http://127.0.0.1:$servePort"
+            exit 0
+        }
+        Write-Output "failed to start; check whether port $servePort is free"
+        exit 1
+    }
+    "serve-stop" {
+        $conns = Get-NetTCPConnection -LocalPort $servePort -State Listen -ErrorAction SilentlyContinue
+        if (-not $conns) { Write-Output "nothing listening on $servePort"; exit 0 }
+        foreach ($c in $conns) { taskkill /F /PID $c.OwningProcess 2>&1 | Out-Null }
+        Write-Output "stopped server on port $servePort"
+        exit 0
+    }
+}
 
 $configPath = Join-Path $env:USERPROFILE ".config\opencode\notify-qq.json"
 
@@ -60,7 +97,7 @@ switch ($Action.ToLower()) {
         Write-Output ("away auto-push: " + $(if ($next) { "ON" } else { "OFF" }))
     }
     default {
-        Write-Output "usage: notify-qq [on|off|status|toggle]"
+        Write-Output "usage: notify-qq [on|off|status|toggle|serve|serve-stop]"
         exit 2
     }
 }

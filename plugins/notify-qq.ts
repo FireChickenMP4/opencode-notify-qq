@@ -261,22 +261,21 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
-   * A short headline for a push.
+   * Condense the turn's final assistant output for a push.
    *
-   * The last assistant message is often a long multi-section reply; pasting all
-   * of it into a QQ notification is unreadable. Take the LAST paragraph (usually
-   * the wrap-up line) and cap it. Returns "" when nothing usable.
+   * We take the WHOLE last assistant message (that is what the agent ended the
+   * turn with), not one paragraph of it - picking "the last paragraph" grabbed
+   * trailing questions ("want me to...?"), and picking "the first" grabbed
+   * headings. Markdown is preserved so QQ renders it; only runaway blank lines
+   * are collapsed and the length is capped.
    */
   function headline(text: string): string {
-    const paragraphs = text
-      .split(/\n{2,}/)
-      .map((p) => p.replace(/\s+/g, " ").trim())
-      .filter(Boolean);
-    const last = paragraphs.at(-1) ?? "";
-    // A final paragraph that is mostly markdown furniture is not a summary.
-    const cleaned = last.replace(/^[#>\-*\s]+/, "").trim();
-    if (cleaned.length < 8) return "";
-    return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
+    const body = text
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]+$/gm, "")
+      .trim();
+    if (body.length < 4) return "";
+    return body.length > 500 ? `${body.slice(0, 497)}...` : body;
   }
 
   return {
