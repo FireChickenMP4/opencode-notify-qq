@@ -148,11 +148,61 @@ bun run src/notify.ts "构建完成了"          # 推一条
 bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 ```
 
+## 远程审批（bridge）
+
+不开 opencode 的 HTTP API 之外的东西：跑一个 server，`bridge` 订阅它的事件，
+把待审批的请求推到 QQ，你回一个字就批准/拒绝。
+
+### 启动
+
+```powershell
+# 1. 起 server（一个进程承载所有 TUI；plugin 只实例化一次）
+opencode serve --hostname 127.0.0.1 --port 4096
+
+# 2. 另开终端，attach（想开几个开几个）
+opencode attach http://127.0.0.1:4096
+
+# 3. 再另开终端，起 bridge（唯一持有 QQ WSS 的进程）
+$env:OPENCODE_SERVER_URL = "http://127.0.0.1:4096"
+bun run src/bridge.ts
+```
+
+`bun run src/bridge.ts --check` 先验证配置 + 凭据 + server 可达。
+
+### 用
+
+有权限请求时，QQ 收到：
+
+```text
+【需要授权】D:\Desktop\workflow
+工具: bash
+内容: rm -rf build
+回复 .o=once  .a=always(记住)  .r=reject
+```
+
+回复（**大小写、单个字母或整词、中英文都认，前导 `.` 可省**）：
+
+| 回复 | 效果 |
+|---|---|
+| `o` / `O` / `.o` / `once` / `Once` / `批准` | 只批这一次 |
+| `a` / `A` / `.a` / `always` / `Always` / `记住` | 记住，之后同类不再问 |
+| `r` / `R` / `.r` / `reject` / `Reject` / `拒绝` | 拒绝 |
+
+多个请求挂起时按**先到先处理**（FIFO），避免 `o` 指向不明。
+
+> **`reject` 之后**：opencode 自行决定后续（这不在我们控制内）。要继续就发 `.task`（后续阶段）。
+
+> **为什么 bridge 必须单例**：QQ 的 WSS 同一 appId+shard 多开会互踢
+> （`op 9 Invalid Session`）。所以只能有一个进程持有连接，其余全走 HTTP。
+
+---
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `NOTIFY_QQ_CONFIG` | `~/.config/opencode/notify-qq.json` | 配置路径 |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4096` | bridge 连的 opencode server |
 | `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口 |
 | `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
 
@@ -175,6 +225,7 @@ src/
   notify-qq.ps1   # 快捷开关 CLI（on/off/status/toggle）
   notify.ts       # 推送 / 校验 CLI
   listen.ts       # 有界监听（抓 openid、调试事件）
+  bridge.ts       # 远程审批 daemon（SSE + QQ，单例）
 plugins/
   notify-qq.ts    # opencode plugin：notify_qq 工具 + idle 钩子 + 命令
 install.ps1       # 一键安装
