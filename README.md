@@ -148,6 +148,17 @@ bun run src/notify.ts "构建完成了"          # 推一条
 bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 ```
 
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `NOTIFY_QQ_CONFIG` | `~/.config/opencode/notify-qq.json` | 配置路径 |
+| `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口 |
+| `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
+
+事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录每个
+`permission.asked` / idle 事件与发送结果——"该通知却没通知"时先看它。
+
 ## 已知限制
 
 - **主动消息窗口**：官方对主动推送有限制——用户近期未与机器人交互时可能被拒。所以"你刚说过话"的窗口内最可靠。

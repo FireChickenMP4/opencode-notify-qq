@@ -15,6 +15,27 @@
  */
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
+import { appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * File log for the event path.
+ *
+ * opencode's own log does not record event dispatch, so without this a
+ * notification that "should" have fired but did not is invisible. Disable with
+ * OPENCODE_NOTIFY_QQ_LOG=0.
+ */
+function trace(line: string): void {
+  if (process.env.OPENCODE_NOTIFY_QQ_LOG === "0") return;
+  try {
+    appendFileSync(join(HERE, "notify-qq.events.log"), `${new Date().toISOString()} ${line}\n`, "utf8");
+  } catch {
+    /* diagnostics must never break anything */
+  }
+}
 
 type Client = {
   sendText: (m: string) => Promise<{ id?: string }>;
@@ -75,13 +96,18 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
 
   /** Send, swallowing errors so a notification never breaks a session. */
   async function trySend(text: string): Promise<string> {
-    if (!api) return `notify_qq unavailable: ${loadError}`;
+    if (!api) {
+      trace(`send skipped: api not loaded (${loadError})`);
+      return `notify_qq unavailable: ${loadError}`;
+    }
     try {
       const result = await api.sendText(text);
+      trace(`sent: ${text}`);
       return `sent to QQ (id=${result.id ?? "?"})`;
     } catch (cause) {
       const err = cause as { message?: string; code?: number };
       const code = typeof err?.code === "number" ? ` (code=${err.code})` : "";
+      trace(`send FAILED: ${err?.message ?? String(cause)}${code}`);
       return `failed to send: ${err?.message ?? String(cause)}${code}`;
     }
   }
@@ -117,23 +143,36 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   return {
     event: async ({ event }) => {
       const type = event.type;
+      if (type !== "permission.asked" && type !== "session.status") return;
+      trace(`event:${type}`);
 
       // A permission request means the agent is BLOCKED and cannot proceed
       // without you. This is the most important "come back" signal, so it is
       // sent even though it is not "completion".
       if (type === "permission.asked") {
-        if (!awayEnabled()) return;
-        if (!shouldSend("permission")) return;
+        if (!awayEnabled()) {
+          trace("permission skipped: awayNotify is off");
+          return;
+        }
+        if (!shouldSend("permission")) {
+          trace("permission skipped: dedup");
+          return;
+        }
         await trySend(`opencode · 需要授权 [${workspace}]`);
         return;
       }
 
       // V2 signals "done" via session.status with status.type === "idle".
-      if (type !== "session.status") return;
       const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
       if (status?.type !== "idle") return;
-      if (!awayEnabled()) return;
-      if (!shouldSend("idle")) return;
+      if (!awayEnabled()) {
+        trace("idle skipped: awayNotify is off");
+        return;
+      }
+      if (!shouldSend("idle")) {
+        trace("idle skipped: dedup");
+        return;
+      }
       await trySend(`opencode · 完成 [${workspace}]`);
     },
 
