@@ -1,14 +1,15 @@
 /**
- * Stable short numbers for sessions.
+ * Short numbers for sessions.
  *
  * A session id is a long opaque string (e.g. ses_f32fea229ffei4uHDu8vDoIOV8),
  * which is impossible to type from a phone. This maps each session to a small
  * integer (1, 2, 3...) so a reply can name one: `.stop #2`, `.task #1 do X`.
  *
- * Numbers are stable: the same id always yields the same number, and a number
- * is never reused. They are also persisted, because two processes show them -
- * the bridge owns permission notices, the plugin owns completion notices - and
- * both must agree. The bridge allocates and writes; the plugin only reads.
+ * A number is stable while its session stays live, and the smallest free number
+ * is reused once a session is pruned - so numbers stay small instead of
+ * climbing forever. They are persisted because two processes show them: the
+ * bridge owns permission notices, the plugin owns completion notices. The
+ * bridge allocates and prunes; the plugin only reads.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -59,18 +60,41 @@ export class SessionNumbers {
     }
   }
 
-  /** The stable number for a session, assigning and persisting on first sight. */
+  /**
+   * The stable number for a session, assigning and persisting on first sight.
+   *
+   * Reuses the smallest free number rather than max+1, so numbers stay small
+   * instead of drifting up forever. Stability holds while the session is live;
+   * once prune() drops it, its number can be handed to another session.
+   */
   numberFor(id: string): number {
     const existing = this.#byId.get(id);
     if (existing !== undefined) return existing;
-    // Next free number is max+1, not size+1: loaded maps can have gaps.
-    let max = 0;
-    for (const n of this.#byNum.keys()) if (n > max) max = n;
-    const n = max + 1;
+    // Smallest positive integer not currently in use.
+    let n = 1;
+    while (this.#byNum.has(n)) n++;
     this.#byId.set(id, n);
     this.#byNum.set(n, id);
     this.#save();
     return n;
+  }
+
+  /**
+   * Drop numbers for sessions that are no longer live, freeing their slots.
+   *
+   * Without this the map only grows: every session that ever emitted an event
+   * would hold a number forever. The bridge passes the ids of currently live
+   * main sessions; anything else is released.
+   */
+  prune(liveIds: Set<string>): void {
+    let changed = false;
+    for (const [n, id] of [...this.#byNum]) {
+      if (liveIds.has(id)) continue;
+      this.#byNum.delete(n);
+      this.#byId.delete(id);
+      changed = true;
+    }
+    if (changed) this.#save();
   }
 
   /** Read-only lookup; never allocates. */
@@ -81,11 +105,6 @@ export class SessionNumbers {
   /** Resolve a number back to a session id, or undefined if unknown. */
   resolve(n: number): string | undefined {
     return this.#byNum.get(n);
-  }
-
-  /** Known sessions as [number, id] pairs, ascending. */
-  entries(): Array<[number, string]> {
-    return [...this.#byNum.entries()].sort((a, b) => a[0] - b[0]);
   }
 }
 

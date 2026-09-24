@@ -19,6 +19,7 @@ import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
 import { SessionNumbers, sessionNumbersPath } from "./sessions";
+import { TaskQueue } from "./task-queue";
 
 const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096").replace(
   /\/$/,
@@ -67,25 +68,50 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 
 type OpencodeEvent = { id?: string; type?: string; properties?: Record<string, unknown> };
-type Session = { id: string; directory?: string; agent?: string };
+type Session = { id: string; directory?: string; agent?: string; parentID?: string };
 
 let sessions: Session[] | null = null;
 let sessionsAt = 0;
 
-/** Session list changes rarely; cache it so each permission is one round-trip. */
-async function sessionInfo(sessionID: string): Promise<Session> {
+/**
+ * All sessions, cached briefly.
+ *
+ * `limit` is raised because the default page (100) is too small to decide which
+ * sessions are still alive for numbering reclamation.
+ */
+async function allSessions(): Promise<Session[]> {
   if (!sessions || Date.now() - sessionsAt > 60_000) {
-    const res = await fetch(`${BASE}/session`);
+    const res = await fetch(`${BASE}/session?limit=1000`);
     if (res.ok) {
       sessions = (await res.json()) as Session[];
       sessionsAt = Date.now();
     }
   }
-  return sessions?.find((s) => s.id === sessionID) ?? { id: sessionID };
+  return sessions ?? [];
+}
+
+/** Session list changes rarely; cache it so each permission is one round-trip. */
+async function sessionInfo(sessionID: string): Promise<Session> {
+  return (await allSessions()).find((s) => s.id === sessionID) ?? { id: sessionID };
 }
 
 async function sessionDirectory(sessionID: string): Promise<string> {
   return (await sessionInfo(sessionID)).directory ?? "(unknown)";
+}
+
+/** True while the session has a turn running (status "busy" or "retry"). */
+async function sessionIsBusy(sessionID: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE}/session/status`);
+    if (!res.ok) return false;
+    const all = (await res.json()) as Record<string, { type?: string }>;
+    const t = all[sessionID]?.type;
+    return t === "busy" || t === "retry";
+  } catch {
+    // On failure assume idle: injecting is the intent, and a wrong "busy"
+    // would silently strand the message.
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,27 +204,92 @@ let lastSessionID: string | null = null;
 /** Stable short numbers so a phone reply can name a session (shared via file). */
 const sessionNumbers = new SessionNumbers(sessionNumbersPath());
 
-/** Record a session from an event and return its display number. */
-function rememberSession(sessionID: string): number {
+/**
+ * Messages deferred to the end of the running turn.
+ *
+ * opencode has no working "deliver after this turn" route: `prompt_async` (the
+ * only one that delivers) always steers into the running turn, and the v2
+ * `delivery:"queue"` flag is accepted but never honoured. So `.task` - which
+ * means "after you finish, do this" - is queued HERE and released when the
+ * session reports idle.
+ */
+const taskQueue = new TaskQueue();
+
+/**
+ * Sessions currently being drained. One finished turn emits several idle
+ * signals; without this guard two of them would race and send the same queued
+ * text twice.
+ */
+const draining = new Set<string>();
+
+/**
+ * Record a session from an event and return its display number.
+ *
+ * Subagent sessions do not get numbers: they are ephemeral and would inflate
+ * the count, and you never need to address one remotely. They still set
+ * lastSessionID so untargeted commands hit the session that is actually active.
+ */
+function rememberSession(sessionID: string): number | undefined {
   lastSessionID = sessionID;
+  if (subagentIds.has(sessionID)) return undefined;
   return sessionNumbers.numberFor(sessionID);
+}
+
+/** Sessions known to be subagents (have a parentID). */
+const subagentIds = new Set<string>();
+let registryAt = 0;
+
+/**
+ * How many recent main sessions keep a number.
+ *
+ * Numbers would otherwise climb forever, since every session that ever emitted
+ * an event would hold one. Only recent ones matter (you reply to a notification
+ * you just received), so older ones are released and their numbers reused.
+ */
+const NUMBER_WINDOW = Number(process.env.OPENCODE_NOTIFY_QQ_NUMBER_WINDOW ?? 30);
+
+/**
+ * Refresh the subagent set and reclaim numbers from stale sessions.
+ *
+ * Throttled: the session list barely changes, and this runs on every event.
+ */
+async function refreshSessionRegistry(): Promise<void> {
+  if (Date.now() - registryAt < 30_000) return;
+  registryAt = Date.now();
+
+  const list = await allSessions();
+  if (!list.length) return; // fetch failed; never wipe numbers on empty data
+
+  subagentIds.clear();
+  const main = list.filter((s) => {
+    if (s.parentID) {
+      subagentIds.add(s.id);
+      return false;
+    }
+    return true;
+  });
+  // Most recently updated main sessions keep their numbers.
+  const recent = main
+    .sort((a, b) => ((b as { time?: { updated?: number } }).time?.updated ?? 0) - ((a as { time?: { updated?: number } }).time?.updated ?? 0))
+    .slice(0, NUMBER_WINDOW)
+    .map((s) => s.id);
+  sessionNumbers.prune(new Set(recent));
 }
 
 /**
  * Fallback target when no event has been seen yet: the most recently updated
- * session. Without this, `.stop` right after startup says "no known session"
- * even though there is an obvious candidate.
+ * MAIN session. Without this, `.stop` right after startup says "no known
+ * session" even though there is an obvious candidate. Subagents are excluded -
+ * aborting one is never what you meant.
  */
 async function mostRecentSession(): Promise<string | null> {
-  try {
-    const res = await fetch(`${BASE}/session`);
-    if (!res.ok) return null;
-    const list = (await res.json()) as Array<{ id?: string; time?: { updated?: number } }>;
-    const sorted = [...list].sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
-    return sorted[0]?.id ?? null;
-  } catch {
-    return null;
-  }
+  const main = (await allSessions()).filter((s) => !s.parentID);
+  const sorted = [...main].sort(
+    (a, b) =>
+      ((b as { time?: { updated?: number } }).time?.updated ?? 0) -
+      ((a as { time?: { updated?: number } }).time?.updated ?? 0),
+  );
+  return sorted[0]?.id ?? null;
 }
 
 /**
@@ -206,9 +297,10 @@ async function mostRecentSession(): Promise<string | null> {
  *
  * An explicit "#N" wins (and says so when unknown). Otherwise the most recent
  * session we have seen, then the most recently updated one as a startup
- * fallback.
+ * fallback. `num` is absent only if the target is a subagent, which cannot be
+ * named but can still be acted on by an untargeted command.
  */
-async function resolveTarget(target?: number): Promise<{ id: string; num: number } | null> {
+async function resolveTarget(target?: number): Promise<{ id: string; num?: number } | null> {
   if (target !== undefined) {
     const id = sessionNumbers.resolve(target);
     return id ? { id, num: target } : null;
@@ -216,6 +308,33 @@ async function resolveTarget(target?: number): Promise<{ id: string; num: number
   const id = lastSessionID ?? (await mostRecentSession());
   if (!id) return null;
   return { id, num: rememberSession(id) };
+}
+
+/**
+ * Release one queued `.task` for a session whose turn just ended.
+ *
+ * One at a time: sending starts a new turn, so the next item waits for the next
+ * idle. That keeps a burst of `.task` messages in order instead of merging them.
+ * If the send fails the item is put back, so a transient error does not lose it.
+ */
+async function drainQueue(sessionID: string): Promise<void> {
+  const text = taskQueue.peek(sessionID);
+  if (!text || draining.has(sessionID)) return;
+  draining.add(sessionID);
+  try {
+    await prompt(sessionID, text);
+    taskQueue.shift(sessionID);
+    const rest = taskQueue.size(sessionID);
+    const num = sessionNumbers.lookup(sessionID);
+    await sendText(`开始排队任务${num !== undefined ? ` #${num}` : ""}: ${text.slice(0, 80)}`);
+    log(`command: task drained (${rest} still pending)`);
+  } catch (cause) {
+    log(`drain failed, keeping queued: ${cause instanceof Error ? cause.message : cause}`);
+  } finally {
+    // Hold the guard briefly so the idle burst that triggered this cannot
+    // immediately start the next item; the next real idle will.
+    setTimeout(() => draining.delete(sessionID), 2000);
+  }
 }
 
 async function runCommand(cmd: Command): Promise<void> {
@@ -226,7 +345,7 @@ async function runCommand(cmd: Command): Promise<void> {
     return;
   }
   const { id: target, num } = resolved;
-  const tag = `[#${num} ${await sessionDirectory(target)}]`;
+  const tag = `[${num !== undefined ? `#${num} ` : ""}${await sessionDirectory(target)}]`;
   try {
     if (cmd.kind === "stop") {
       await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
@@ -244,10 +363,25 @@ async function runCommand(cmd: Command): Promise<void> {
       return;
     }
 
-    // Both kinds inject a message; it runs after the current turn.
+    if (cmd.kind === "ask") {
+      // .ask means "steer into the running turn"; prompt_async already does that.
+      await prompt(target, cmd.text);
+      await sendText(`已插话 ${tag}: ${cmd.text.slice(0, 80)}`);
+      log("command: ask");
+      return;
+    }
+
+    // .task means "when you finish, do this". If a turn is running, hold it and
+    // release on idle; otherwise there is nothing to wait for, send now.
+    if (await sessionIsBusy(target)) {
+      const n = taskQueue.push(target, cmd.text);
+      await sendText(`已排队 ${tag}（本轮结束后执行，队列 ${n} 条）: ${cmd.text.slice(0, 80)}`);
+      log(`command: task queued (${n} pending)`);
+      return;
+    }
     await prompt(target, cmd.text);
     await sendText(`已发送 ${tag}: ${cmd.text.slice(0, 80)}`);
-    log(`command: ${cmd.kind}`);
+    log("command: task (idle, sent now)");
   } catch (cause) {
     await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
   }
@@ -347,11 +481,24 @@ export function formatPermission(
 
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
+    // Keep the subagent set and number reclamation current before any numbering
+    // decision (throttled internally).
+    await refreshSessionRegistry();
+
     // Track the most recent session from ANY event, not just permissions:
     // `.stop` / `.task` need a target even when no permission has fired. The
     // number it returns is what the notification shows and a reply can name.
     const anySessionID = event.properties?.sessionID;
     if (typeof anySessionID === "string" && anySessionID) rememberSession(anySessionID);
+
+    // Release any .task held for this session once its turn ends.
+    if (
+      event.type === "session.status" &&
+      typeof anySessionID === "string" &&
+      (event.properties?.status as { type?: string } | undefined)?.type === "idle"
+    ) {
+      await drainQueue(anySessionID);
+    }
 
     if (event.type !== "permission.updated" && event.type !== "permission.asked") return;
     const p = event.properties ?? {};

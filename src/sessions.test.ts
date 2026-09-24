@@ -45,13 +45,6 @@ describe("SessionNumbers", () => {
     expect(s.resolve(2)).toBeUndefined(); // lookup did not create #2
   });
 
-  test("entries are ascending and complete", () => {
-    const s = new SessionNumbers();
-    s.numberFor("ses_a");
-    s.numberFor("ses_b");
-    expect(s.entries()).toEqual([[1, "ses_a"], [2, "ses_b"]]);
-  });
-
   test("persists across instances (survives restart)", () => {
     const dir = mkdtempSync(join(tmpdir(), "sessnum-"));
     const path = join(dir, "session-numbers.json");
@@ -77,6 +70,47 @@ describe("SessionNumbers", () => {
       const ro = readSessionNumbers(path);
       expect(ro.lookup("ses_a")).toBeUndefined();
       expect(readFileSync).toBeDefined(); // file was never created by a read
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("reuses the smallest free number (does not drift up)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sessnum-"));
+    const path = join(dir, "session-numbers.json");
+    try {
+      const s = new SessionNumbers(path);
+      s.numberFor("a"); // 1
+      s.numberFor("b"); // 2
+      s.numberFor("c"); // 3
+      s.prune(new Set(["a", "c"])); // frees 2
+      expect(s.numberFor("d")).toBe(2); // reuses the freed slot
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("prune releases numbers not in the live set", () => {
+    const s = new SessionNumbers();
+    s.numberFor("a");
+    s.numberFor("b");
+    s.prune(new Set(["a"]));
+    expect(s.lookup("a")).toBe(1);
+    expect(s.lookup("b")).toBeUndefined();
+    expect(s.resolve(2)).toBeUndefined();
+  });
+
+  test("prune persists the shrink", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sessnum-"));
+    const path = join(dir, "session-numbers.json");
+    try {
+      const first = new SessionNumbers(path);
+      first.numberFor("a");
+      first.numberFor("b");
+      first.prune(new Set(["a"]));
+      const second = new SessionNumbers(path);
+      expect(second.lookup("a")).toBe(1);
+      expect(second.lookup("b")).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
