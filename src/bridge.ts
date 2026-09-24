@@ -15,6 +15,7 @@
  *   bun run src/bridge.ts --help
  */
 
+import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendText, type GatewayEvent } from "./qqbot";
 
@@ -28,6 +29,31 @@ const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096"
  * attempt is ignored. Chosen to sit next to opencode's 4096 default.
  */
 const LOCK_PORT = Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097);
+
+/**
+ * Records this bridge's identity ({pid, hash}) so the plugin can tell whether
+ * the running daemon is from the current source. Without it, a bridge spawned
+ * detached from an older build is reused forever (the lock port makes startup
+ * idempotent), and every bridge change needs a manual kill.
+ */
+const STATE_PATH = process.env.OPENCODE_NOTIFY_QQ_BRIDGE_STATE;
+
+function writeState(): void {
+  if (!STATE_PATH) return;
+  try {
+    writeFileSync(
+      STATE_PATH,
+      JSON.stringify({
+        pid: process.pid,
+        hash: process.env.OPENCODE_NOTIFY_QQ_BRIDGE_HASH ?? "",
+        startedAt: Date.now(),
+      }),
+      "utf8",
+    );
+  } catch {
+    /* the state file is an optimization; never block startup on it */
+  }
+}
 
 function log(message: string): void {
   console.log(`[bridge] ${message}`);
@@ -414,6 +440,7 @@ async function run(): Promise<number> {
     console.error(`stop it first, or set OPENCODE_NOTIFY_QQ_LOCK_PORT to a free port.`);
     return 3;
   }
+  writeState();
 
   const client = new QqBotClient({
     onLog: (m) => log(`gateway: ${m}`),

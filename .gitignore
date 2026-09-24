@@ -7,3 +7,8 @@ package-lock.json
 Thumbs.db
 .vscode/
 .idea/
+
+# runtime state
+bridge.state.json
+notify-qq.events.log
+bridge.log

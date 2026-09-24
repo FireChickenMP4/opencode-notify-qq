@@ -6,6 +6,7 @@
 #   notify-qq toggle       -> flip
 #   notify-qq serve        -> ensure `opencode serve` is running (idempotent)
 #   notify-qq serve-stop   -> stop it
+#   notify-qq serve-restart-> stop serve AND the bridge, then start serve
 #
 # Works while opencode is running: the plugin re-reads the config on every
 # event, so the change takes effect immediately. Nothing here talks to opencode.
@@ -18,9 +19,24 @@ $ErrorActionPreference = "Stop"
 
 # --- server management belongs here so the user has one entry point ---------
 $servePort = if ($env:OPENCODE_NOTIFY_QQ_SERVE_PORT) { [int]$env:OPENCODE_NOTIFY_QQ_SERVE_PORT } else { 4096 }
+$bridgePort = if ($env:OPENCODE_NOTIFY_QQ_LOCK_PORT) { [int]$env:OPENCODE_NOTIFY_QQ_LOCK_PORT } else { 4097 }
 
 function Test-Port([int]$Port) {
     return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+
+function Stop-PortHolder([int]$Port) {
+    $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($c in $conns) { taskkill /F /PID $c.OwningProcess 2>&1 | Out-Null }
+    return [bool]$conns
+}
+
+function Start-Serve {
+    $exe = (Get-Command opencode -ErrorAction SilentlyContinue).Source
+    if (-not $exe) { Write-Output "opencode not found on PATH"; exit 1 }
+    Start-Process -FilePath $exe -ArgumentList "serve", "--port", "$servePort" -WindowStyle Hidden | Out-Null
+    Start-Sleep -Seconds 6
+    return (Test-Port $servePort)
 }
 
 switch ($Action.ToLower()) {
@@ -29,11 +45,7 @@ switch ($Action.ToLower()) {
             Write-Output "opencode serve already running on port $servePort"
             exit 0
         }
-        $exe = (Get-Command opencode -ErrorAction SilentlyContinue).Source
-        if (-not $exe) { Write-Output "opencode not found on PATH"; exit 1 }
-        Start-Process -FilePath $exe -ArgumentList "serve", "--port", "$servePort" -WindowStyle Hidden | Out-Null
-        Start-Sleep -Seconds 6
-        if (Test-Port $servePort) {
+        if (Start-Serve) {
             Write-Output "opencode serve started on port $servePort"
             Write-Output "now attach with: opencode attach http://127.0.0.1:$servePort"
             exit 0
@@ -42,11 +54,24 @@ switch ($Action.ToLower()) {
         exit 1
     }
     "serve-stop" {
-        $conns = Get-NetTCPConnection -LocalPort $servePort -State Listen -ErrorAction SilentlyContinue
-        if (-not $conns) { Write-Output "nothing listening on $servePort"; exit 0 }
-        foreach ($c in $conns) { taskkill /F /PID $c.OwningProcess 2>&1 | Out-Null }
+        if (-not (Stop-PortHolder $servePort)) { Write-Output "nothing listening on $servePort"; exit 0 }
         Write-Output "stopped server on port $servePort"
         exit 0
+    }
+    "serve-restart" {
+        # The plugin auto-replaces a stale bridge on next start (it compares the
+        # daemon's source hash), so killing the bridge here guarantees the new
+        # build is picked up without a separate manual step.
+        if (Stop-PortHolder $bridgePort) { Write-Output "stopped bridge on port $bridgePort" }
+        if (Stop-PortHolder $servePort) { Write-Output "stopped server on port $servePort" }
+        Start-Sleep -Seconds 1
+        if (Start-Serve) {
+            Write-Output "opencode serve restarted on port $servePort (plugins + bridge now current)"
+            Write-Output "reattach with: opencode attach http://127.0.0.1:$servePort"
+            exit 0
+        }
+        Write-Output "failed to restart; check whether port $servePort is free"
+        exit 1
     }
 }
 
@@ -97,7 +122,7 @@ switch ($Action.ToLower()) {
         Write-Output ("away auto-push: " + $(if ($next) { "ON" } else { "OFF" }))
     }
     default {
-        Write-Output "usage: notify-qq [on|off|status|toggle|serve|serve-stop]"
+        Write-Output "usage: notify-qq [on|off|status|toggle|serve|serve-stop|serve-restart]"
         exit 2
     }
 }

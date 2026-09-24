@@ -15,7 +15,7 @@
  */
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -74,12 +74,13 @@ async function loadClient(): Promise<Client> {
 }
 
 /**
- * Make sure the bridge daemon is running.
+ * Make sure the bridge daemon is running *from the current source*.
  *
  * Idempotent by construction: the bridge binds a lock port, so starting a
- * second one simply exits. Here we probe the port first and only spawn when
- * nothing is listening - so opening N opencode instances still yields exactly
- * one bridge.
+ * second one simply exits. But that alone would reuse a bridge spawned from an
+ * older build forever. So the bridge records {pid, hash} of its source; if the
+ * running one's hash differs, we kill it and spawn fresh. This removes the
+ * "changed bridge.ts, must kill the old daemon by hand" step.
  *
  * The bridge is spawned detached: it must outlive the opencode process, since
  * its job is to keep serving approvals while you are away. Nothing stops it on
@@ -89,24 +90,30 @@ async function ensureBridge(): Promise<void> {
   if (process.env.OPENCODE_NOTIFY_QQ_BRIDGE === "0") return;
   const port = Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097);
 
-  if (await isPortOpen(port)) {
-    trace(`bridge already running (port ${port})`);
+  const here = dirname(fileURLToPath(import.meta.url));
+  // Installed layout: <plugins>/notify-qq/bridge.ts ; repo layout: <repo>/src/bridge.ts
+  const candidates = [join(here, "notify-qq", "bridge.ts"), join(here, "..", "src", "bridge.ts")];
+  const script = candidates.find((p) => existsSync(p));
+  if (!script) {
+    trace(`bridge not started: script not found (${candidates.join(", ")})`);
     return;
+  }
+
+  const hash = bridgeHash(script);
+  const statePath = bridgeStatePath();
+
+  if (await isPortOpen(port)) {
+    if (await runningBridgeIsCurrent(statePath, hash)) {
+      trace(`bridge already running (port ${port}, hash ${hash})`);
+      return;
+    }
+    trace(`bridge is stale (hash mismatch); replacing`);
+    await stopStaleBridge(statePath, port);
   }
 
   try {
     const { spawn } = await import("node:child_process");
-    const { dirname, join } = await import("node:path");
-    const { fileURLToPath } = await import("node:url");
-    const { existsSync, openSync } = await import("node:fs");
-    const here = dirname(fileURLToPath(import.meta.url));
-    // Installed layout: <plugins>/notify-qq/bridge.ts ; repo layout: <repo>/src/bridge.ts
-    const candidates = [join(here, "notify-qq", "bridge.ts"), join(here, "..", "src", "bridge.ts")];
-    const script = candidates.find((p) => existsSync(p));
-    if (!script) {
-      trace(`bridge not started: script not found (${candidates.join(", ")})`);
-      return;
-    }
+    const { openSync } = await import("node:fs");
     const logFd = openSync(BRIDGE_LOG, "a");
     const child = spawn("bun", ["run", script], {
       detached: true,
@@ -114,11 +121,83 @@ async function ensureBridge(): Promise<void> {
       // URL, gateway conflict) the only way to see why is this output.
       stdio: ["ignore", logFd, logFd],
       windowsHide: true,
+      env: {
+        ...process.env,
+        OPENCODE_NOTIFY_QQ_BRIDGE_STATE: statePath,
+        OPENCODE_NOTIFY_QQ_BRIDGE_HASH: hash,
+      },
     });
     child.unref();
-    trace(`bridge spawned pid=${child.pid} (log: ${BRIDGE_LOG})`);
+    trace(`bridge spawned pid=${child.pid} (hash ${hash}, log: ${BRIDGE_LOG})`);
   } catch (cause) {
     trace(`bridge spawn failed: ${cause instanceof Error ? cause.message : cause}`);
+  }
+}
+
+/** Content hash of the bridge entry so a rebuilt daemon can be detected. */
+export function bridgeHash(script: string): string {
+  try {
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(readFileSync(script));
+    return hasher.digest("hex").slice(0, 16);
+  } catch {
+    return "";
+  }
+}
+
+function bridgeStatePath(): string {
+  return process.env.OPENCODE_NOTIFY_QQ_BRIDGE_STATE || join(HERE, "bridge.state.json");
+}
+
+/** True when the recorded bridge pid is alive and was built from `hash`. */
+export async function runningBridgeIsCurrent(statePath: string, hash: string): Promise<boolean> {
+  if (!hash) return true; // cannot verify; assume fine rather than churn processes
+  try {
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { pid?: number; hash?: string };
+    if (state.hash !== hash) return false;
+    if (!state.pid) return false;
+    process.kill(state.pid, 0); // throws if the pid is gone
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Kill the daemon named in the state file; fall back to whoever holds `port`. */
+async function stopStaleBridge(statePath: string, port: number): Promise<void> {
+  let pid: number | undefined;
+  try {
+    pid = (JSON.parse(readFileSync(statePath, "utf8")) as { pid?: number }).pid;
+  } catch {
+    /* no state file: fall through to the port probe */
+  }
+  if (pid) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  } else {
+    await killPortHolder(port);
+  }
+  await new Promise((r) => setTimeout(r, 300)); // let the lock port release
+}
+
+/** Last resort when no state file exists: find the pid listening on `port`. */
+async function killPortHolder(port: number): Promise<void> {
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const run = promisify(execFile);
+    const { stdout } = await run("powershell", [
+      "-NoProfile",
+      "-Command",
+      `(Get-NetTCPConnection -LocalPort ${port} -State Listen -EA SilentlyContinue).OwningProcess`,
+    ]);
+    const pid = Number(stdout.trim().split(/\s+/)[0]);
+    if (pid) process.kill(pid, "SIGKILL");
+  } catch {
+    /* best effort */
   }
 }
 
