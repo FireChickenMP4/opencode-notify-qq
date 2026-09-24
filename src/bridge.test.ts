@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { parseCommand, parseReply } from "../src/bridge";
+import { parseCommand, parseReply, promptPath } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -75,5 +75,14 @@ describe("parseCommand", () => {
     expect(parseCommand("o")).toBeUndefined();
     expect(parseCommand("hello")).toBeUndefined();
     expect(parseCommand(".taskx no")).toBeUndefined();
+  });
+});
+
+describe("promptPath", () => {
+  test("uses prompt_async, not the no-op v2 admit route", () => {
+    // The v2 `/api/session/{id}/prompt` accepts a prompt and returns an
+    // admittedSeq but never delivers it. Regression guard.
+    expect(promptPath("ses_abc")).toBe("/session/ses_abc/prompt_async");
+    expect(promptPath("ses_abc")).not.toContain("/api/session/");
   });
 });

@@ -134,10 +134,14 @@ export type Command =
  * Parse a leading-dot command. Returns undefined for anything else, so ordinary
  * chatter and o/a/r replies pass through untouched.
  *
- *   .task <text>     queue a task; runs after the current turn
- *   .ask  <text>     light interjection; steers immediately; same as .task when idle
+ *   .task <text>     inject a message; runs after the current turn
+ *   .ask  <text>     same injection (kept as a distinct word for habit)
  *   .stop            abort the running turn (highest priority)
  *   .restart         restart the session's agent loop (abort + continue)
+ *
+ * Note: both .task and .ask queue after the running turn. opencode has no
+ * working "steer into the middle of the current turn" route - the v2 delivery
+ * flag is accepted but never honoured (see prompt()).
  */
 export function parseCommand(text: string): Command | undefined {
   const m = text.trim().match(/^[.．]\s*(task|ask|stop|restart)\b\s*([\s\S]*)$/i);
@@ -192,23 +196,36 @@ async function runCommand(cmd: Command): Promise<void> {
       return;
     }
 
-    // task = queue for after this turn; ask = steer into it now.
-    await prompt(target, cmd.text, cmd.kind === "task" ? "queue" : "steer");
-    await sendText(`已${cmd.kind === "task" ? "排队" : "插话"}: ${cmd.text.slice(0, 80)}`);
+    // Both kinds inject a message; it runs after the current turn.
+    await prompt(target, cmd.text);
+    await sendText(`已发送: ${cmd.text.slice(0, 80)}`);
     log(`command: ${cmd.kind}`);
   } catch (cause) {
     await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
   }
 }
 
-/** Inject a prompt into a session. `delivery` decides queue-vs-steer. */
-async function prompt(sessionID: string, text: string, delivery?: "queue" | "steer"): Promise<void> {
-  const res = await fetch(`${BASE}/api/session/${sessionID}/prompt`, {
+/**
+ * The route that actually delivers a message.
+ *
+ * NOT `/api/session/{id}/prompt`: that v2 route looks canonical (returns an
+ * `admittedSeq`) but is a no-op - measured, an admitted prompt never appears in
+ * the session even while a turn is running. `prompt_async` delivers and starts
+ * the session if idle. Exported so the choice is locked by a test.
+ */
+export function promptPath(sessionID: string): string {
+  return `/session/${sessionID}/prompt_async`;
+}
+
+/**
+ * Inject a message into a session via `promptPath`.
+ */
+async function prompt(sessionID: string, text: string): Promise<void> {
+  const res = await fetch(`${BASE}${promptPath(sessionID)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt: { text }, ...(delivery ? { delivery } : {}) }),
+    body: JSON.stringify({ parts: [{ type: "text", text }] }),
   });
-  // Older builds lack /api/session/{id}/prompt; fall back to the v1 route.
   if (res.ok) return;
   const fallback = await fetch(`${BASE}/session/${sessionID}/message`, {
     method: "POST",
