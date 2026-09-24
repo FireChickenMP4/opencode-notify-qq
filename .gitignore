@@ -12,3 +12,4 @@ Thumbs.db
 bridge.state.json
 notify-qq.events.log
 bridge.log
+notify-qq.undelivered.log

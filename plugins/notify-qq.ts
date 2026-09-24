@@ -51,6 +51,8 @@ function trace(line: string): void {
     /** Long-running bash watchdog (timer-based). */
     BashWatch: typeof import("../src/bash-watch").BashWatch;
     bashAlert: typeof import("../src/bash-watch").bashAlert;
+    /** Retry helper for delivery. */
+    deliverWithRetry: typeof import("../src/deliver").deliverWithRetry;
   };
 
 // The client sources sit next to this file once installed as
@@ -64,6 +66,7 @@ async function loadClient(): Promise<Client> {
       const config = await import(qqbotPath.replace("qqbot.ts", "config.ts"));
       const sessions = await import(qqbotPath.replace("qqbot.ts", "sessions.ts"));
       const watch = await import(qqbotPath.replace("qqbot.ts", "bash-watch.ts"));
+      const deliver = await import(qqbotPath.replace("qqbot.ts", "deliver.ts"));
       return {
         sendText: qqbot.sendText,
         sendMarkdown: qqbot.sendMarkdown,
@@ -75,6 +78,7 @@ async function loadClient(): Promise<Client> {
         sessionNumber: (sessionID: string) => sessions.readSessionNumbers().lookup(sessionID),
         BashWatch: watch.BashWatch,
         bashAlert: watch.bashAlert,
+        deliverWithRetry: deliver.deliverWithRetry,
       };
     } catch {
       continue;
@@ -335,22 +339,29 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
     })
     .catch(() => {});
 
-  /** Send, swallowing errors so a notification never breaks a session. */
+  /** Send, retrying a transient failure so a notification is not silently lost. */
   async function trySend(text: string, markdown = false): Promise<string> {
     if (!api) {
       trace(`send skipped: api not loaded (${loadError})`);
       return `notify_qq unavailable: ${loadError}`;
     }
-    try {
-      const result = markdown ? await api.sendMarkdown(text) : await api.sendText(text);
+    const doSend = () => (markdown ? api!.sendMarkdown(text) : api!.sendText(text)).then(() => {});
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const outcome = await api.deliverWithRetry(doSend, sleep);
+
+    if (outcome.ok) {
       trace(`sent: ${text}`);
-      return `sent to QQ (id=${result.id ?? "?"})`;
-    } catch (cause) {
-      const err = cause as { message?: string; code?: number };
-      const code = typeof err?.code === "number" ? ` (code=${err.code})` : "";
-      trace(`send FAILED: ${err?.message ?? String(cause)}${code}`);
-      return `failed to send: ${err?.message ?? String(cause)}${code}`;
+      return "sent to QQ";
     }
+    // Give up, but leave a durable trace: a lost remote notification is exactly
+    // what this feature exists to prevent, so it must not vanish.
+    trace(`send FAILED after ${outcome.attempts} attempts: ${outcome.error}`);
+    try {
+      appendFileSync(join(HERE, "notify-qq.undelivered.log"), `${new Date().toISOString()} ${text}\n`, "utf8");
+    } catch {
+      /* the log is best-effort; the failure is already traced */
+    }
+    return `failed to send after ${outcome.attempts} attempts: ${outcome.error}`;
   }
 
   /** Read the switch fresh - this is what makes the config file the real control. */
