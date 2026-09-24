@@ -241,6 +241,25 @@ export function pickFinalText(
   return "";
 }
 
+/**
+ * Tidy the turn's closing text for a push.
+ *
+ * The input is already the final text-only message, so it is complete and must
+ * NOT be trimmed to a headline: an earlier 800-char cap silently cut the tail
+ * off ordinary replies. QQ markdown accepts far more (verified >12k chars), so
+ * `maxChars` is only a runaway guard.
+ *
+ * Exported for testing.
+ */
+export function normalizeFinalText(text: string, maxChars: number): string {
+  const body = text
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+  if (body.length < 4) return "";
+  return body.length > maxChars ? `${body.slice(0, Math.max(0, maxChars - 3))}...` : body;
+}
+
 export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   let api: Client | null = null;
   let loadError: string | null = null;
@@ -366,17 +385,16 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   /**
    * Normalize the closing text for a push.
    *
-   * The input is already the turn's final text-only message, so it is complete:
-   * just tidy whitespace and cap runaway length. Markdown is preserved so QQ
-   * renders it.
+   * The input is already the turn's final text-only message, so it is complete
+   * and must NOT be trimmed to a headline: an earlier 800-char cap silently cut
+   * the tail off ordinary replies ("...notify-qq ..."). QQ markdown accepts far
+   * more (verified >12k chars), so the cap is only a runaway guard, raised and
+   * overridable.
    */
+  const MAX_CHARS = Number(process.env.OPENCODE_NOTIFY_QQ_MAX_CHARS ?? 4000);
+
   function headline(text: string): string {
-    const body = text
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/[ \t]+$/gm, "")
-      .trim();
-    if (body.length < 4) return "";
-    return body.length > 800 ? `${body.slice(0, 797)}...` : body;
+    return normalizeFinalText(text, MAX_CHARS);
   }
 
   return {
