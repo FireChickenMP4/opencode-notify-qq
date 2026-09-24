@@ -71,44 +71,111 @@
 
 ---
 
-## 4. 后续：`.task` 指派任务（未实现）
+## 4. 远程控制（设计）
 
-设想：用 `.task` 开头的消息给 agent 派活。
+### 4.1 关键发现：opencode 有完整 HTTP API
 
-### 4.1 必须解决的并发问题
+实测 `opencode serve`（1.18.32）确认，控制面**不需要 plugin 收发**：
 
-**多个 opencode 同时开 → WSS 会冲突。** 所以不能每个 opencode 各连一条。
+| 能力 | 端点 |
+|---|---|
+| 订阅事件（SSE） | `GET /event` |
+| 发消息 | `POST /session/{id}/message`（支持 `delivery: steer\|queue`） |
+| 中断 | `POST /session/{id}/abort` |
+| **审批回复** | `POST /permission/{requestID}/reply` `{"reply":"once"\|"always"\|"reject"}` |
+| 待审批列表 | `GET /permission` |
+| 已存权限 | `GET/POST/DELETE /api/permission/saved` |
+| 会话列表 | `GET /session`（`Session.directory` 给出工作区） |
 
-### 4.2 建议架构
+`once` / `always` / `reject` 三种回复与预期完全一致。
+
+> 版本注意：已装 SDK 1.15.13，二进制 1.18.32。以运行中 server 的 `/doc` 为准；
+> 优先用 v1 路由（`/session/...`、`/permission/...`、`/event`），两版都有。
+
+### 4.2 架构：单 server + bridge（选 B）
+
+采用 **B：`opencode serve` + `opencode attach`** —— 一个 server 进程承载所有 TUI，
+plugin 只有一个实例，**没有多实例聚合问题**。
 
 ```text
-                  唯一 WSS 连接
-QQ 用户 ──消息──> [qqbot daemon]        （独立进程，单例）
-                       │
-                       ├─ 写入队列目录 / 本地 socket / 命名管道
-                       │
-        ┌──────────────┼──────────────┐
-   opencode A      opencode B      opencode C
-   （读队列，不持有 WS）
+QQ 用户 ──WSS(唯一)──> [bridge]  （独立进程，单例）
+                          │
+                          ├─ GET /event  (SSE) 订阅事件
+                          ├─ GET /permission    待审批
+                          └─ POST /permission/{id}/reply   回复
+                                     │
+                              opencode serve (127.0.0.1:P)
+                                     ▲
+                              opencode attach (多个 TUI)
 ```
 
-要点：
+**为什么不是每个 plugin 各连一条 WSS**：
+- WSS 同 appId+shard 多开会互踢（见 §4.4）
+- bridge 单例持有唯一连接，所有 opencode 通过 HTTP 与它交互
+- plugin 的职责缩减为"**上报自己的 serverUrl**"（bridge 需要知道连哪）
 
-- **daemon 是单例**，持有唯一 WSS 连接，负责 Identify/心跳/Resume
-- opencode 侧**永不持有 WSS**，只从队列取消息
-- 队列可选：文件目录（最简单）、本地 TCP/Unix socket、SQLite
-- 需要一个"已领取/处理中"标记，避免两个 opencode 抢同一条
+### 4.3 远程审批（先做）
 
-### 4.3 待定问题
+流程：
 
-- **派给谁**：消息如何路由到特定 opencode 会话？需要 `cwd` / 项目 / 显式 tag
-- **回复**：结果发回 QQ 需要拿到原消息的 `msg_id`（被动回复才有窗口）
-- **权限**：`.task` 意味着远程执行，要有白名单与确认机制
-- **幂等**：断线重连会补发事件（Resume），去重靠 `event.id`
+```text
+permission.asked (SSE)
+   → 取 Session.directory（哪个工作区）
+   → 取 PermissionRequest：permission / patterns / metadata / always
+   → QQ 消息：
+       【需要授权】<工作区>
+        工具: bash
+        命令: rm -rf build
+        o=once  a=always(记住)  r=reject
+   → 用户回 o / a / r（大写也认）
+   → POST /permission/{id}/reply
+```
 
-### 4.4 不做的话
+**缩写映射**（按用户要求，大小写都接受）：
 
-如果最终不做 daemon，也可以只在**单会话**下用：启动时独占 WSS，退出时释放。代价是同时只能开一个 opencode 收任务。
+| 输入 | 回复 | 含义 |
+|---|---|---|
+| `o` / `O` | `once` | 只批这一次 |
+| `a` / `A` | `always` | 记住，之后同类不再问 |
+| `r` / `R` | `reject` | 拒绝 |
+
+**关于 reject 终止会话**：`reject` 是拒绝该权限请求，opencode 收到后会自行决定
+后续（这不在我们的控制范围内）。用户选择 reject 后**自己再发 `.task` 继续**。
+
+### 4.4 WSS 单例约束（为什么不每实例一条）
+
+官方 `session_start_limit` 限制并发；同一 appId+shard 重复 Identify 触发
+`op 9 Invalid Session`，旧连接被踢。**所以收消息的进程只能有一个** —— 这就是
+bridge 必须单例的原因。
+
+### 4.5 指令集（后续阶段）
+
+| 指令 | 语义 | 阻塞性 |
+|---|---|---|
+| `.task <内容>` | 派任务，**queue 到本轮结束**（`delivery:"queue"`） | 排队 |
+| `.ask <内容>` | 轻量插话（`delivery:"steer"`）；会话已结束时等同于 `.task` | 立即 |
+| `.stop` | 中断当前执行（`POST /session/{id}/abort`），**最高优先级** | 立即 |
+| `.restart` | 重启工作流 | — |
+
+`.ask` 与 `.task` **只在阻塞性上有区别**：`.ask` 插话不打断当前回合，`.task`
+排队等本轮结束；若会话已结束，二者效果相同。
+
+### 4.6 每轮结束发送总结（后续阶段）
+
+现在的空闲钩子只发固定文案 `opencode · 完成`。改进：让 agent **输出本轮总结**
+再推送，而不是只报"完成"。实现要点待定（如何在事件回调里拿到本轮输出）。
+
+### 4.7 安全
+
+- bridge 绑定 `127.0.0.1`；若需外网，走隧道 + `OPENCODE_SERVER_PASSWORD`
+- `.task` 意味着远程执行，需要**白名单 + 确认**
+- 幂等：断线重连会补发事件（Resume），去重靠 `event.id`
+
+### 4.8 分阶段
+
+1. **远程审批**（本次）—— 最刚需
+2. 每轮总结
+3. `.task` / `.ask` / `.stop` / `.restart`
 
 ---
 
