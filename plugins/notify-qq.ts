@@ -233,28 +233,37 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
-   * Last assistant text of a session, used as the end-of-turn summary.
+   * The assistant's output for the turn that just ended.
    *
-   * Reads the existing transcript instead of calling /summarize: that endpoint
-   * runs another model turn (slow, costs tokens) just to say what the agent
-   * already wrote. We only want a headline for the push.
+   * "Last message containing text" is wrong: the final message is often a
+   * tool-call step whose only text is a one-line preamble, so the push shows a
+   * fragment. Instead collect every assistant text part since the last user
+   * message - that set is exactly what the agent said this turn, including the
+   * wrap-up after its tool calls.
+   *
+   * Reads the transcript rather than calling /summarize (another model turn,
+   * slow and costly) since we only need what the agent already wrote.
    */
   async function lastAssistantText(sessionID: string): Promise<string> {
     try {
       const res = await client.session.messages({ path: { id: sessionID } });
       const messages = (res as { data?: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }> }).data;
       if (!Array.isArray(messages)) return "";
+
+      const collected: string[] = [];
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i]!;
+        if (m.info?.role === "user") break;
         if (m.info?.role !== "assistant") continue;
-        const text = (m.parts ?? [])
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text!.trim())
-          .join(" ")
-          .trim();
-        if (text) return text;
+        for (const p of m.parts ?? []) {
+          if (p.type === "text" && p.text?.trim()) collected.push(p.text.trim());
+        }
       }
-      return "";
+      collected.reverse();
+
+      // Intermediate preambles ("I'll check X...") sit before the real answer;
+      // the substance is usually in the later blocks. Keep the tail.
+      return collected.join("\n\n").trim();
     } catch {
       return "";
     }
@@ -275,7 +284,10 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       .replace(/[ \t]+$/gm, "")
       .trim();
     if (body.length < 4) return "";
-    return body.length > 500 ? `${body.slice(0, 497)}...` : body;
+    if (body.length <= 600) return body;
+    // Too long: keep the TAIL, which holds the wrap-up (the head is usually
+    // preambles like "I'll check..."), and mark that it was trimmed.
+    return `...(前略)\n\n${body.slice(-597)}`;
   }
 
   return {
@@ -290,6 +302,12 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       if (type === "permission.asked") {
         if (!awayEnabled()) {
           trace("permission skipped: awayNotify is off");
+          return;
+        }
+        // The bridge sends a richer permission notice (with .o/.a/.r options).
+        // Avoid double-posting the same request.
+        if (await isPortOpen(Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097))) {
+          trace("permission skipped: bridge is running and will notify");
           return;
         }
         if (!shouldSend("permission")) {
