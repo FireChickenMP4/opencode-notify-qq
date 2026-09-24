@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadConfig, setIdleNotify } from "../src/config";
+import { loadConfig, setAwayNotify } from "../src/config";
 
 const dirs: string[] = [];
 function temp(content?: string): string {
@@ -32,36 +32,36 @@ const creds = {
   },
 };
 
-describe("idleNotify parsing", () => {
+describe("awayNotify parsing", () => {
   test("defaults to OFF when absent", () => {
-    expect(loadConfig(temp(JSON.stringify(creds))).idleNotify).toBe(false);
+    expect(loadConfig(temp(JSON.stringify(creds))).awayNotify).toBe(false);
   });
 
   test("accepts a bare boolean", () => {
-    expect(loadConfig(temp(JSON.stringify({ ...creds, idleNotify: true }))).idleNotify).toBe(true);
+    expect(loadConfig(temp(JSON.stringify({ ...creds, awayNotify: true }))).awayNotify).toBe(true);
   });
 
   test("accepts { enabled: boolean }", () => {
-    expect(loadConfig(temp(JSON.stringify({ ...creds, idleNotify: { enabled: true } }))).idleNotify).toBe(true);
+    expect(loadConfig(temp(JSON.stringify({ ...creds, awayNotify: { enabled: true } }))).awayNotify).toBe(true);
   });
 
   test("a non-boolean enabled falls back to OFF", () => {
-    expect(loadConfig(temp(JSON.stringify({ ...creds, idleNotify: { enabled: "yes" } }))).idleNotify).toBe(false);
+    expect(loadConfig(temp(JSON.stringify({ ...creds, awayNotify: { enabled: "yes" } }))).awayNotify).toBe(false);
   });
 });
 
-describe("setIdleNotify", () => {
+describe("setAwayNotify", () => {
   test("round-trips true and false", () => {
     const p = temp(JSON.stringify(creds));
-    setIdleNotify(true, p);
-    expect(loadConfig(p).idleNotify).toBe(true);
-    setIdleNotify(false, p);
-    expect(loadConfig(p).idleNotify).toBe(false);
+    setAwayNotify(true, p);
+    expect(loadConfig(p).awayNotify).toBe(true);
+    setAwayNotify(false, p);
+    expect(loadConfig(p).awayNotify).toBe(false);
   });
 
   test("preserves credentials and unknown keys", () => {
     const p = temp(JSON.stringify({ ...creds, somethingElse: 42 }));
-    setIdleNotify(true, p);
+    setAwayNotify(true, p);
     const after = JSON.parse(readFileSync(p, "utf8"));
     expect(after.qqbot.appId).toBe("102000");
     expect(after.somethingElse).toBe(42);

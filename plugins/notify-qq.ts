@@ -19,8 +19,8 @@ import { tool, type Plugin } from "@opencode-ai/plugin";
 type Client = {
   sendText: (m: string) => Promise<{ id?: string }>;
   configPath: () => string;
-  loadConfig: () => { qqbot?: { notifyTarget?: unknown }; idleNotify: boolean };
-  setIdleNotify: (enabled: boolean) => boolean;
+  loadConfig: () => { qqbot?: { notifyTarget?: unknown }; awayNotify: boolean };
+  setAwayNotify: (enabled: boolean) => boolean;
 };
 
 // The client sources sit next to this file once installed as
@@ -36,7 +36,7 @@ async function loadClient(): Promise<Client> {
         sendText: qqbot.sendText,
         configPath: config.configPath,
         loadConfig: config.loadConfig,
-        setIdleNotify: config.setIdleNotify,
+        setAwayNotify: config.setAwayNotify,
       };
     } catch {
       continue;
@@ -87,22 +87,53 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /** Read the switch fresh - this is what makes the config file the real control. */
-  function idleEnabled(): boolean {
+  function awayEnabled(): boolean {
     if (!api) return false;
     try {
-      return api.loadConfig().idleNotify === true;
+      return api.loadConfig().awayNotify === true;
     } catch {
       return false;
     }
   }
 
+  /**
+   * Suppress duplicates within a short window.
+   *
+   * One finished turn can emit several `session.status` idle signals in the
+   * same second - an ESC interrupt produces a burst. Without this, one
+   * end-of-turn becomes two or three QQ messages.
+   */
+  const DEDUP_MS = Number(process.env.OPENCODE_NOTIFY_QQ_DEDUP_MS ?? 5000);
+  const lastSent = new Map<string, number>();
+
+  function shouldSend(kind: string): boolean {
+    const now = Date.now();
+    const prev = lastSent.get(kind) ?? 0;
+    if (now - prev < DEDUP_MS) return false;
+    lastSent.set(kind, now);
+    return true;
+  }
+
   return {
     event: async ({ event }) => {
+      const type = event.type;
+
+      // A permission request means the agent is BLOCKED and cannot proceed
+      // without you. This is the most important "come back" signal, so it is
+      // sent even though it is not "completion".
+      if (type === "permission.asked") {
+        if (!awayEnabled()) return;
+        if (!shouldSend("permission")) return;
+        await trySend(`opencode · 需要授权 [${workspace}]`);
+        return;
+      }
+
       // V2 signals "done" via session.status with status.type === "idle".
-      if (event.type !== "session.status") return;
+      if (type !== "session.status") return;
       const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
       if (status?.type !== "idle") return;
-      if (!idleEnabled()) return;
+      if (!awayEnabled()) return;
+      if (!shouldSend("idle")) return;
       await trySend(`opencode · 完成 [${workspace}]`);
     },
 
@@ -121,10 +152,10 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
 
       qq_switch: tool({
         description:
-          "Read or change whether opencode auto-pushes QQ when a turn finishes. " +
-          "status=true reports; otherwise set enabled.",
+          "Read or change whether opencode pushes QQ while you are away " +
+          "(turn finished or a permission is waiting). status=true reports; otherwise set enabled.",
         args: {
-          enabled: tool.schema.boolean().optional().describe("new state for idle auto-push"),
+          enabled: tool.schema.boolean().optional().describe("new state for away auto-push"),
           status: tool.schema.boolean().optional().describe("report the current state instead of changing it"),
         },
         async execute(args) {
@@ -133,11 +164,11 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
             if (args.status) {
               const cfg = api.loadConfig();
               const hasTarget = Boolean(cfg.qqbot?.notifyTarget);
-              return `idle auto-push: ${cfg.idleNotify ? "ON" : "OFF"} | target configured: ${hasTarget ? "yes" : "no"} | config: ${api.configPath()}`;
+              return `away auto-push: ${cfg.awayNotify ? "ON" : "OFF"} | target configured: ${hasTarget ? "yes" : "no"} | config: ${api.configPath()}`;
             }
             if (typeof args.enabled === "boolean") {
-              const now = api.setIdleNotify(args.enabled);
-              return `idle auto-push is now ${now ? "ON" : "OFF"} (takes effect immediately)`;
+              const now = api.setAwayNotify(args.enabled);
+              return `away auto-push is now ${now ? "ON" : "OFF"} (takes effect immediately)`;
             }
             return "nothing to do: pass status=true or enabled=<bool>";
           } catch (cause) {

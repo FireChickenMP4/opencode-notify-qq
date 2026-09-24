@@ -40,18 +40,23 @@ export type QqBotConfig = {
 export type NotifyConfig = {
   qqbot?: QqBotConfig;
   /**
-   * Auto-push QQ when a turn finishes (the "I'm away, ping me when it's done"
-   * case). Off by default: enabling it means every finished turn pings your
-   * phone, which is only wanted while you are actually away.
+   * Auto-push QQ while you are away. Covers both cases where the agent needs
+   * you back:
+   *   - a turn finished (task done, safe to check later)
+   *   - a permission request is waiting (agent is BLOCKED, come back now)
+   *
+   * Off by default: enabling it means every finished turn pings your phone,
+   * which is only wanted while you are actually away.
    *
    * Read fresh on every event, so flipping the value in the JSON file takes
-   * effect without restarting opencode.
+   * effect without restarting opencode - and it works while the agent is busy,
+   * which is exactly when you need to turn it on.
    */
-  idleNotify: boolean;
+  awayNotify: boolean;
 };
 
-/** Default: idle notifications are OFF. */
-export const IDLE_NOTIFY_DEFAULT = false;
+/** Default: away notifications are OFF. */
+export const AWAY_NOTIFY_DEFAULT = false;
 
 export function defaultConfigPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -109,29 +114,31 @@ export function loadConfig(path = configPath()): NotifyConfig {
   const qqbot = parseQqBot(raw.qqbot);
 
   // Accept either a boolean or { enabled: boolean } so the file reads naturally
-  // whichever shape the user writes.
-  let idleNotify = IDLE_NOTIFY_DEFAULT;
-  const rawIdle = raw.idleNotify;
-  if (typeof rawIdle === "boolean") {
-    idleNotify = rawIdle;
-  } else if (rawIdle && typeof rawIdle === "object") {
-    const enabled = (rawIdle as Raw).enabled;
-    if (typeof enabled === "boolean") idleNotify = enabled;
+  // whichever shape the user writes. `idleNotify` is accepted as a legacy alias.
+  let awayNotify = AWAY_NOTIFY_DEFAULT;
+  const rawAway = raw.awayNotify ?? raw.idleNotify;
+  if (typeof rawAway === "boolean") {
+    awayNotify = rawAway;
+  } else if (rawAway && typeof rawAway === "object") {
+    const enabled = (rawAway as Raw).enabled;
+    if (typeof enabled === "boolean") awayNotify = enabled;
   }
 
-  return { ...(qqbot ? { qqbot } : {}), idleNotify };
+  return { ...(qqbot ? { qqbot } : {}), awayNotify };
 }
 
 /**
- * Flip the idle-notify switch in the config file, preserving everything else.
- * Returns the new value. Used by the /qq-on and /qq-off commands.
+ * Flip the away-notify switch in the config file, preserving everything else.
+ * Returns the new value. Used by the notify-qq shell function.
  */
-export function setIdleNotify(enabled: boolean, path = configPath()): boolean {
+export function setAwayNotify(enabled: boolean, path = configPath()): boolean {
   let raw: Raw = {};
   if (existsSync(path)) {
     raw = JSON.parse(readFileSync(path, "utf8")) as Raw;
   }
-  raw.idleNotify = { enabled };
+  raw.awayNotify = { enabled };
+  // Drop the legacy key so there is a single source of truth.
+  delete raw.idleNotify;
   writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
   return enabled;
 }

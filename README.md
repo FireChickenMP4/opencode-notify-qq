@@ -42,7 +42,7 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
       "openid": "你的 openid"
     }
   },
-  "idleNotify": {
+  "awayNotify": {
     "enabled": false
   }
 }
@@ -54,7 +54,7 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
 | `sandbox` | 沙箱环境填 `true`（域名与凭据都不同） |
 | `notifyTarget.type` | `c2c`（单聊）或 `group`（群聊） |
 | `notifyTarget.openid` | `c2c` 用；`group` 时改用 `groupOpenid` |
-| `idleNotify.enabled` | 回合结束时**自动**推 QQ。**默认 false** |
+| `awayNotify.enabled` | 回合结束时**自动**推 QQ。**默认 false** |
 
 > 这个文件含密钥，**永远不要提交**。它不在任何仓库里。
 
@@ -99,15 +99,20 @@ bun run src/listen.ts 90        # 监听 90 秒
 | 方式 | 触发 | 默认 |
 |---|---|---|
 | **agent 主动推** | agent 判断该通知你时调 `notify_qq` | 开 |
-| **回合结束自动推** | 每次回合结束 | **关** |
+| **离开时自动推** | 回合结束 **或** 有权限请求在等你 | **关** |
 
-### 我想离开电脑，等任务完成通知我
+### 我要离开电脑，需要时叫我
 
-打开 `idleNotify.enabled`，之后每次回合结束都会推 QQ：
+打开 `awayNotify.enabled`：
 
 ```json
-{ "idleNotify": { "enabled": true } }
+{ "awayNotify": { "enabled": true } }
 ```
+
+之后两种"需要你回来"的情况都会推 QQ：
+
+- **回合结束**（任务跑完了，可以回来看）
+- **权限请求**（agent **被卡住**了，必须你现在处理）
 
 **改完立即生效**——配置在每次事件时重新读取，不需要重启 opencode，也不需要
 agent 空闲（这正是你离开时的状态）。
@@ -154,7 +159,7 @@ bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 ```text
 src/
   qqbot.ts        # 官方 Bot 客户端（纯手写，REST + WSS）
-  config.ts       # 配置层（密钥 + idleNotify 开关，不进仓库）
+  config.ts       # 配置层（密钥 + awayNotify 开关，不进仓库）
   config.test.ts  # 配置层单测
   notify-qq.ps1   # 快捷开关 CLI（on/off/status/toggle）
   notify.ts       # 推送 / 校验 CLI

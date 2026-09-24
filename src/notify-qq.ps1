@@ -21,40 +21,43 @@ if (-not (Test-Path $configPath)) {
     exit 1
 }
 
-# Preserve every other field; only touch idleNotify.
+# Preserve every other field; only touch awayNotify.
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
 
 switch ($Action.ToLower()) {
     "on" {
-        $config.idleNotify = [pscustomobject]@{ enabled = $true }
+        $config.awayNotify = [pscustomobject]@{ enabled = $true }
+        if ($config.PSObject.Properties["idleNotify"]) { $config.PSObject.Properties.Remove("idleNotify") }
         $json = $config | ConvertTo-Json -Depth 12
         [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Output "idle auto-push: ON  (takes effect immediately)"
+        Write-Output "away auto-push: ON  (takes effect immediately)"
     }
     "off" {
-        $config.idleNotify = [pscustomobject]@{ enabled = $false }
+        $config.awayNotify = [pscustomobject]@{ enabled = $false }
+        if ($config.PSObject.Properties["idleNotify"]) { $config.PSObject.Properties.Remove("idleNotify") }
         $json = $config | ConvertTo-Json -Depth 12
         [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Output "idle auto-push: OFF"
+        Write-Output "away auto-push: OFF"
     }
     "status" {
         $state = "OFF"
-        if ($config.idleNotify -is [bool]) { $state = if ($config.idleNotify) { "ON" } else { "OFF" } }
-        elseif ($config.idleNotify.enabled -eq $true) { $state = "ON" }
+        if ($config.awayNotify -is [bool]) { $state = if ($config.awayNotify) { "ON" } else { "OFF" } }
+        elseif ($config.awayNotify.enabled -eq $true) { $state = "ON" }
         $target = if ($config.qqbot.notifyTarget) { "yes" } else { "no" }
-        Write-Output "idle auto-push: $state"
+        Write-Output "away auto-push: $state"
         Write-Output "target configured: $target"
         Write-Output "config: $configPath"
     }
     "toggle" {
         $current = $false
-        if ($config.idleNotify -is [bool]) { $current = $config.idleNotify }
-        elseif ($config.idleNotify.enabled -eq $true) { $current = $true }
+        if ($config.awayNotify -is [bool]) { $current = $config.awayNotify }
+        elseif ($config.awayNotify.enabled -eq $true) { $current = $true }
         $next = -not $current
-        $config.idleNotify = [pscustomobject]@{ enabled = $next }
+        $config.awayNotify = [pscustomobject]@{ enabled = $next }
+        if ($config.PSObject.Properties["idleNotify"]) { $config.PSObject.Properties.Remove("idleNotify") }
         $json = $config | ConvertTo-Json -Depth 12
         [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Output ("idle auto-push: " + $(if ($next) { "ON" } else { "OFF" }))
+        Write-Output ("away auto-push: " + $(if ($next) { "ON" } else { "OFF" }))
     }
     default {
         Write-Output "usage: notify-qq [on|off|status|toggle]"
