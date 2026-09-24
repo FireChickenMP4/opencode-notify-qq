@@ -76,6 +76,12 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 插件在启动时加载。重启后 agent 就有 `notify_qq` 工具了。
 
+> **注意：plugin 由 `opencode serve` 进程加载，不是 attach 的 TUI。**
+> 若你用 `opencode attach <url>` 连着自己的 serve，改插件后**只重启 TUI 不生效**，
+> 必须重启 `serve`（或裸 `opencode`）。判断方法：
+> `Select-String -Path "$env:USERPROFILE\.local\share\opencode\log\opencode.log" -Pattern 'notify_qq tool registered'`
+> 看最后一条加载时间是否晚于你改文件的时间。
+
 ## 拿到自己的 openid
 
 openid **按机器人隔离**（同一个人在不同机器人下不同），且没有查询接口，只能从事件里抓：
