@@ -18,7 +18,7 @@
 import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
-import { SessionNumbers } from "./sessions";
+import { SessionNumbers, sessionNumbersPath } from "./sessions";
 
 const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096").replace(
   /\/$/,
@@ -175,8 +175,8 @@ export function parseCommand(text: string): Command | undefined {
 /** The session a command should act on: the most recent one we have seen. */
 let lastSessionID: string | null = null;
 
-/** Stable short numbers so a phone reply can name a session. */
-const sessionNumbers = new SessionNumbers();
+/** Stable short numbers so a phone reply can name a session (shared via file). */
+const sessionNumbers = new SessionNumbers(sessionNumbersPath());
 
 /** Record a session from an event and return its display number. */
 function rememberSession(sessionID: string): number {

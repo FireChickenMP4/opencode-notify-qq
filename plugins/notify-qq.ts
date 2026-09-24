@@ -46,6 +46,8 @@ function trace(line: string): void {
     configPath: () => string;
     loadConfig: () => { qqbot?: { notifyTarget?: unknown }; awayNotify: boolean };
     setAwayNotify: (enabled: boolean) => boolean;
+    /** Read-only session numbers, shared with the bridge via file. */
+    sessionNumber: (sessionID: string) => number | undefined;
   };
 
 // The client sources sit next to this file once installed as
@@ -57,12 +59,16 @@ async function loadClient(): Promise<Client> {
     try {
       const qqbot = await import(qqbotPath);
       const config = await import(qqbotPath.replace("qqbot.ts", "config.ts"));
+      const sessions = await import(qqbotPath.replace("qqbot.ts", "sessions.ts"));
       return {
         sendText: qqbot.sendText,
         sendMarkdown: qqbot.sendMarkdown,
         configPath: config.configPath,
         loadConfig: config.loadConfig,
         setAwayNotify: config.setAwayNotify,
+        // Re-read each call: the bridge allocates numbers while we run, and this
+        // plugin is long-lived, so a cached read would go stale.
+        sessionNumber: (sessionID: string) => sessions.readSessionNumbers().lookup(sessionID),
       };
     } catch {
       continue;
@@ -458,11 +464,16 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
       // Disable with OPENCODE_NOTIFY_QQ_SUMMARY=0 for the old bare message.
       const wantSummary = process.env.OPENCODE_NOTIFY_QQ_SUMMARY !== "0";
       const summary = wantSummary && props.sessionID ? headline(await lastAssistantText(props.sessionID)) : "";
+      // Show the session number so a reply can name it (`.stop #2`). The number
+      // is allocated by the bridge; if the bridge never saw this session yet,
+      // omit rather than invent one.
+      const num = props.sessionID ? api?.sessionNumber(props.sessionID) : undefined;
+      const heading = num !== undefined ? `**opencode · 完成 · #${num}**` : `**opencode · 完成**`;
       // Markdown so the heading and body render instead of collapsing into one
       // run-on line.
       const md = summary
-        ? `**opencode · 完成**\n\n\`${workspace}\`\n\n---\n\n${summary}`
-        : `**opencode · 完成**\n\n\`${workspace}\``;
+        ? `${heading}\n\n\`${workspace}\`\n\n---\n\n${summary}`
+        : `${heading}\n\n\`${workspace}\``;
       await trySend(md, true);
     },
 

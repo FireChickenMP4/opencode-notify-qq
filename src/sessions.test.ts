@@ -7,8 +7,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { SessionNumbers } from "../src/sessions";
+import { SessionNumbers, readSessionNumbers } from "../src/sessions";
 
 describe("SessionNumbers", () => {
   test("assigns 1, 2, 3 in first-seen order", () => {
@@ -34,10 +37,48 @@ describe("SessionNumbers", () => {
     expect(s.resolve(99)).toBeUndefined();
   });
 
+  test("lookup never allocates", () => {
+    const s = new SessionNumbers();
+    expect(s.lookup("ses_a")).toBeUndefined();
+    s.numberFor("ses_a");
+    expect(s.lookup("ses_a")).toBe(1);
+    expect(s.resolve(2)).toBeUndefined(); // lookup did not create #2
+  });
+
   test("entries are ascending and complete", () => {
     const s = new SessionNumbers();
     s.numberFor("ses_a");
     s.numberFor("ses_b");
     expect(s.entries()).toEqual([[1, "ses_a"], [2, "ses_b"]]);
+  });
+
+  test("persists across instances (survives restart)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sessnum-"));
+    const path = join(dir, "session-numbers.json");
+    try {
+      const first = new SessionNumbers(path);
+      expect(first.numberFor("ses_a")).toBe(1);
+      expect(first.numberFor("ses_b")).toBe(2);
+
+      const second = new SessionNumbers(path);
+      expect(second.lookup("ses_a")).toBe(1);
+      expect(second.lookup("ses_b")).toBe(2);
+      // A new session continues from max+1, not from scratch.
+      expect(second.numberFor("ses_c")).toBe(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("readSessionNumbers is read-only and tolerates a missing file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sessnum-"));
+    const path = join(dir, "session-numbers.json");
+    try {
+      const ro = readSessionNumbers(path);
+      expect(ro.lookup("ses_a")).toBeUndefined();
+      expect(readFileSync).toBeDefined(); // file was never created by a read
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
