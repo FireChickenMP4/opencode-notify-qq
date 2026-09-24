@@ -53,4 +53,14 @@ describe("formatPermission", () => {
     expect(out).toContain(".a");
     expect(out).toContain(".r");
   });
+
+  test("shows the session number in the header when known", () => {
+    const out = formatPermission("D:/Desktop", "bash", { command: "x" }, [], 2);
+    expect(out).toContain("#2");
+  });
+
+  test("omits the number when unknown", () => {
+    const out = formatPermission("D:/Desktop", "bash", { command: "x" }, []);
+    expect(out).not.toContain("#");
+  });
 });

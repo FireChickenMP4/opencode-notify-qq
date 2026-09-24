@@ -61,9 +61,20 @@ describe("parseCommand", () => {
     expect(parseCommand(".restart")).toEqual({ kind: "restart" });
   });
 
-  test("case-insensitive, full-width dot", () => {
+  test("case-insensitive, full-width and Chinese dot", () => {
     expect(parseCommand(".TASK upper")).toEqual({ kind: "task", text: "upper" });
     expect(parseCommand("．stop")).toEqual({ kind: "stop" });
+    expect(parseCommand("。stop")).toEqual({ kind: "stop" });
+  });
+
+  test("#N names a session on any command", () => {
+    expect(parseCommand(".stop #2")).toEqual({ kind: "stop", target: 2 });
+    expect(parseCommand(".task #1 deploy it")).toEqual({ kind: "task", text: "deploy it", target: 1 });
+    expect(parseCommand(".ask #12 why")).toEqual({ kind: "ask", text: "why", target: 12 });
+  });
+
+  test("a body starting with a number is not a target", () => {
+    expect(parseCommand(".task 2 things to do")).toEqual({ kind: "task", text: "2 things to do" });
   });
 
   test("a bare .task with no body is not a command", () => {
@@ -75,6 +86,13 @@ describe("parseCommand", () => {
     expect(parseCommand("o")).toBeUndefined();
     expect(parseCommand("hello")).toBeUndefined();
     expect(parseCommand(".taskx no")).toBeUndefined();
+  });
+});
+
+describe("parseReply Chinese dot", () => {
+  test("。a is accepted like .a", () => {
+    expect(parseReply("。a")).toBe("always");
+    expect(parseReply("。r")).toBe("reject");
   });
 });
 

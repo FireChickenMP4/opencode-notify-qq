@@ -18,6 +18,7 @@
 import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
+import { SessionNumbers } from "./sessions";
 
 const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096").replace(
   /\/$/,
@@ -121,7 +122,7 @@ const REPLY_ALIASES: Record<string, Verdict> = {
 };
 
 export function parseReply(text: string): Verdict | undefined {
-  const key = text.trim().replace(/^[.．]/, "").trim().toLowerCase();
+  const key = text.trim().replace(/^[.．。]/, "").trim().toLowerCase();
   return REPLY_ALIASES[key];
 }
 
@@ -130,35 +131,58 @@ export function parseReply(text: string): Verdict | undefined {
 // ---------------------------------------------------------------------------
 
 export type Command =
-  | { kind: "task" | "ask"; text: string }
-  | { kind: "stop" }
-  | { kind: "restart" };
+  | { kind: "task" | "ask"; text: string; target?: number }
+  | { kind: "stop"; target?: number }
+  | { kind: "restart"; target?: number };
 
 /**
  * Parse a leading-dot command. Returns undefined for anything else, so ordinary
  * chatter and o/a/r replies pass through untouched.
  *
- *   .task <text>     inject a message; runs after the current turn
- *   .ask  <text>     same injection (kept as a distinct word for habit)
- *   .stop            abort the running turn (highest priority)
- *   .restart         restart the session's agent loop (abort + continue)
+ *   .task <text>      inject a message; runs after the current turn
+ *   .ask  <text>      same injection (kept as a distinct word for habit)
+ *   .stop             abort the running turn (highest priority)
+ *   .restart          restart the session's agent loop (abort + continue)
+ *
+ * Any command may name a session by number: `.stop #2`, `.task #1 do x`. The
+ * leading dot accepts ASCII, full-width, or the Chinese ideographic full stop,
+ * since a phone IME often produces the last one.
  *
  * Note: both .task and .ask queue after the running turn. opencode has no
  * working "steer into the middle of the current turn" route - the v2 delivery
  * flag is accepted but never honoured (see prompt()).
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．]\s*(task|ask|stop|restart)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|stop|restart)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
   const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop" | "restart";
-  const rest = (m[2] ?? "").trim();
-  if (kind === "stop" || kind === "restart") return { kind };
+  let rest = (m[2] ?? "").trim();
+
+  // Optional leading "#N" target. Stripped before the body is taken, so
+  // `.task #2 deploy` has body "deploy" and target 2.
+  let target: number | undefined;
+  const t = rest.match(/^#\s*(\d+)\b\s*([\s\S]*)$/);
+  if (t) {
+    target = Number(t[1]);
+    rest = (t[2] ?? "").trim();
+  }
+
+  if (kind === "stop" || kind === "restart") return { kind, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
-  return { kind, text: rest };
+  return { kind, text: rest, target };
 }
 
 /** The session a command should act on: the most recent one we have seen. */
 let lastSessionID: string | null = null;
+
+/** Stable short numbers so a phone reply can name a session. */
+const sessionNumbers = new SessionNumbers();
+
+/** Record a session from an event and return its display number. */
+function rememberSession(sessionID: string): number {
+  lastSessionID = sessionID;
+  return sessionNumbers.numberFor(sessionID);
+}
 
 /**
  * Fallback target when no event has been seen yet: the most recently updated
@@ -177,16 +201,36 @@ async function mostRecentSession(): Promise<string | null> {
   }
 }
 
+/**
+ * Resolve which session a command targets.
+ *
+ * An explicit "#N" wins (and says so when unknown). Otherwise the most recent
+ * session we have seen, then the most recently updated one as a startup
+ * fallback.
+ */
+async function resolveTarget(target?: number): Promise<{ id: string; num: number } | null> {
+  if (target !== undefined) {
+    const id = sessionNumbers.resolve(target);
+    return id ? { id, num: target } : null;
+  }
+  const id = lastSessionID ?? (await mostRecentSession());
+  if (!id) return null;
+  return { id, num: rememberSession(id) };
+}
+
 async function runCommand(cmd: Command): Promise<void> {
-  const target = lastSessionID ?? (await mostRecentSession());
-  if (!target) {
-    await sendText(`没有已知会话，无法执行 .${cmd.kind}`);
+  const resolved = await resolveTarget(cmd.target);
+  if (!resolved) {
+    const why = cmd.target !== undefined ? `未知会话编号 #${cmd.target}` : "没有已知会话";
+    await sendText(`${why}，无法执行 .${cmd.kind}`);
     return;
   }
+  const { id: target, num } = resolved;
+  const tag = `[#${num} ${await sessionDirectory(target)}]`;
   try {
     if (cmd.kind === "stop") {
       await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
-      await sendText(`已中断当前执行 [${await sessionDirectory(target)}]`);
+      await sendText(`已中断 ${tag}`);
       log("command: stop");
       return;
     }
@@ -194,7 +238,7 @@ async function runCommand(cmd: Command): Promise<void> {
     if (cmd.kind === "restart") {
       // No dedicated endpoint; abort then send a continuation prompt.
       await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
-      await sendText("已中断，正在重启工作流");
+      await sendText(`已中断，正在重启工作流 ${tag}`);
       await prompt(target, "Continue from where you left off. Re-state the plan and resume.");
       log("command: restart");
       return;
@@ -202,7 +246,7 @@ async function runCommand(cmd: Command): Promise<void> {
 
     // Both kinds inject a message; it runs after the current turn.
     await prompt(target, cmd.text);
-    await sendText(`已发送: ${cmd.text.slice(0, 80)}`);
+    await sendText(`已发送 ${tag}: ${cmd.text.slice(0, 80)}`);
     log(`command: ${cmd.kind}`);
   } catch (cause) {
     await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
@@ -271,8 +315,10 @@ export function formatPermission(
   permission: string,
   metadata: Record<string, unknown>,
   patterns: string[],
+  sessionNum?: number,
 ): string {
-  const lines = [`**需要授权**`, `目录: \`${directory}\``, `工具: **${permission}**`];
+  const header = sessionNum !== undefined ? `**需要授权 · #${sessionNum}**` : `**需要授权**`;
+  const lines = [header, `目录: \`${directory}\``, `工具: **${permission}**`];
 
   if (permission === "external_directory") {
     const dirs = Array.isArray(metadata.directories) ? metadata.directories.map(String) : [];
@@ -302,9 +348,10 @@ export function formatPermission(
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
     // Track the most recent session from ANY event, not just permissions:
-    // `.stop` / `.task` need a target even when no permission has fired.
+    // `.stop` / `.task` need a target even when no permission has fired. The
+    // number it returns is what the notification shows and a reply can name.
     const anySessionID = event.properties?.sessionID;
-    if (typeof anySessionID === "string" && anySessionID) lastSessionID = anySessionID;
+    if (typeof anySessionID === "string" && anySessionID) rememberSession(anySessionID);
 
     if (event.type !== "permission.updated" && event.type !== "permission.asked") return;
     const p = event.properties ?? {};
@@ -317,9 +364,10 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
     const directory = await sessionDirectory(sessionID);
+    const num = sessionID ? rememberSession(sessionID) : undefined;
 
     pending.set(requestID, { requestID, sessionID, permission });
-    await sendMarkdown(formatPermission(directory, permission, metadata, patterns));
+    await sendMarkdown(formatPermission(directory, permission, metadata, patterns, num));
     log(`permission ${requestID} (${permission}) -> QQ`);
   } catch (cause) {
     log(`failed to handle permission: ${cause instanceof Error ? cause.message : cause}`);
