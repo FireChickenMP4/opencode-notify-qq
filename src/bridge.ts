@@ -23,6 +23,12 @@ const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096"
   "",
 );
 
+/**
+ * TCP port used purely as a single-instance lock. Not a service; any connection
+ * attempt is ignored. Chosen to sit next to opencode's 4096 default.
+ */
+const LOCK_PORT = Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097);
+
 function log(message: string): void {
   console.log(`[bridge] ${message}`);
 }
@@ -277,6 +283,19 @@ async function run(): Promise<number> {
     return 2;
   }
 
+  // Single-instance guard. The QQ gateway allows only one WSS per appId+shard;
+  // a second connection kicks the first (op 9). A bound TCP port is the lock:
+  // the OS guarantees uniqueness and releases it when the process dies, so
+  // there are no stale PID files to reason about.
+  let lock: ReturnType<typeof Bun.listen> | null = null;
+  try {
+    lock = Bun.listen({ hostname: "127.0.0.1", port: LOCK_PORT, socket: { data() {} } });
+  } catch {
+    console.error(`another bridge is already running (port ${LOCK_PORT} is in use).`);
+    console.error(`stop it first, or set OPENCODE_NOTIFY_QQ_LOCK_PORT to a free port.`);
+    return 3;
+  }
+
   const client = new QqBotClient({
     onLog: (m) => log(`gateway: ${m}`),
     onEvent: (e) => void handleQqEvent(e),
@@ -285,14 +304,16 @@ async function run(): Promise<number> {
     await client.connect();
   } catch (cause) {
     console.error(`failed to start: ${cause instanceof Error ? cause.message : cause}`);
+    lock.stop(true);
     return 1;
   }
-  log("QQ gateway connected");
+  log(`QQ gateway connected (lock port ${LOCK_PORT})`);
 
   const abort = new AbortController();
   const stop = () => {
     abort.abort();
     client.close();
+    lock?.stop(true);
     process.exit(0);
   };
   process.on("SIGINT", stop);

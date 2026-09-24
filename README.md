@@ -160,17 +160,28 @@ bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 
 ```powershell
 # 1. 起 server（一个进程承载所有 TUI；plugin 只实例化一次）
-opencode serve --hostname 127.0.0.1 --port 4096
+opencode serve --port 4096
 
-# 2. 另开终端，attach（想开几个开几个）
+# 2. attach（想开几个开几个；插件会自动拉起 bridge，无需手动起）
 opencode attach http://127.0.0.1:4096
-
-# 3. 再另开终端，起 bridge（唯一持有 QQ WSS 的进程）
-$env:OPENCODE_SERVER_URL = "http://127.0.0.1:4096"
-bun run src/bridge.ts
 ```
 
-`bun run src/bridge.ts --check` 先验证配置 + 凭据 + server 可达。
+**bridge 由插件自动确保在跑**，你不用手动起：
+
+- 插件启动时探测锁端口（默认 `4097`）；没在跑就 detached 起一个
+- 所以开 N 个 opencode 也**只有一个 bridge**
+- bridge 是 detached 的，**opencode 关了它仍在**（这样你离开时审批照常）
+- 插件关闭时**不**停 bridge（可能还有别的 opencode 在跑）
+
+手动控制（可选）：
+
+```powershell
+$env:OPENCODE_SERVER_URL = "http://127.0.0.1:4096"
+bun run src/bridge.ts              # 手动起
+bun run src/bridge.ts --check      # 验证配置 + 凭据 + server 可达
+```
+
+关掉自动拉起：`OPENCODE_NOTIFY_QQ_BRIDGE=0`。
 
 ### 用
 
@@ -208,6 +219,8 @@ bun run src/bridge.ts
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4096` | bridge 连的 opencode server |
 | `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口 |
 | `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
+| `OPENCODE_NOTIFY_QQ_LOCK_PORT` | `4097` | bridge 单例锁端口 |
+| `OPENCODE_NOTIFY_QQ_BRIDGE` | `1` | 设 `0` 不自动拉起 bridge |
 | `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
 
 事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录每个
@@ -231,6 +244,7 @@ src/
   listen.ts       # 有界监听（抓 openid、调试事件）
   bridge.ts       # 远程审批 daemon（SSE + QQ，单例）
   bridge.test.ts  # 回复解析单测
+  lock.test.ts    # 单例锁单测
 plugins/
   notify-qq.ts    # opencode plugin：notify_qq 工具 + idle 钩子 + 命令
 install.ps1       # 一键安装

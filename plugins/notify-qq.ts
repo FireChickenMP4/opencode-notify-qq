@@ -68,6 +68,64 @@ async function loadClient(): Promise<Client> {
   );
 }
 
+/**
+ * Make sure the bridge daemon is running.
+ *
+ * Idempotent by construction: the bridge binds a lock port, so starting a
+ * second one simply exits. Here we probe the port first and only spawn when
+ * nothing is listening - so opening N opencode instances still yields exactly
+ * one bridge.
+ *
+ * The bridge is spawned detached: it must outlive the opencode process, since
+ * its job is to keep serving approvals while you are away. Nothing stops it on
+ * plugin dispose, on purpose (another opencode may still be running).
+ */
+async function ensureBridge(): Promise<void> {
+  if (process.env.OPENCODE_NOTIFY_QQ_BRIDGE === "0") return;
+  const port = Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097);
+
+  if (await isPortOpen(port)) {
+    trace(`bridge already running (port ${port})`);
+    return;
+  }
+
+  try {
+    const { spawn } = await import("node:child_process");
+    const { dirname, join } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const { existsSync } = await import("node:fs");
+    const here = dirname(fileURLToPath(import.meta.url));
+    // Installed layout: <plugins>/notify-qq/bridge.ts ; repo layout: <repo>/src/bridge.ts
+    const candidates = [join(here, "notify-qq", "bridge.ts"), join(here, "..", "src", "bridge.ts")];
+    const script = candidates.find((p) => existsSync(p));
+    if (!script) {
+      trace(`bridge not started: script not found (${candidates.join(", ")})`);
+      return;
+    }
+    const child = spawn("bun", ["run", script], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    trace(`bridge spawned pid=${child.pid}`);
+  } catch (cause) {
+    trace(`bridge spawn failed: ${cause instanceof Error ? cause.message : cause}`);
+  }
+}
+
+/** True when something is listening on the loopback port. */
+async function isPortOpen(port: number): Promise<boolean> {
+  const attempt = Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: { open() {}, data() {}, close() {}, error() {} },
+  });
+  const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
+  const result = await Promise.race([attempt.then(() => true).catch(() => false), timeout]);
+  return result === true;
+}
+
 export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   let api: Client | null = null;
   let loadError: string | null = null;
@@ -76,6 +134,8 @@ export const NotifyQqPlugin: Plugin = async ({ client, directory }) => {
   } catch (cause) {
     loadError = cause instanceof Error ? cause.message : String(cause);
   }
+
+  await ensureBridge();
 
   const workspace = (() => {
     const dir = directory || process.cwd();
