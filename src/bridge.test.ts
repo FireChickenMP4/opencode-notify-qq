@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { parseCommand, parseReply, promptPath } from "../src/bridge";
+import { formatStatus, parseCommand, parseReply, promptPath } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -60,6 +60,17 @@ describe("parseCommand", () => {
     expect(parseCommand(".stop")).toEqual({ kind: "stop" });
   });
 
+  test("status takes no body, any dot or case", () => {
+    expect(parseCommand(".status")).toEqual({ kind: "status" });
+    expect(parseCommand(".STATUS")).toEqual({ kind: "status" });
+    expect(parseCommand("．status")).toEqual({ kind: "status" });
+    expect(parseCommand("。status")).toEqual({ kind: "status" });
+  });
+
+  test("status accepts an optional #N target", () => {
+    expect(parseCommand(".status #2")).toEqual({ kind: "status", target: 2 });
+  });
+
   test("restart is no longer a command", () => {
     expect(parseCommand(".restart")).toBeUndefined();
   });
@@ -89,6 +100,32 @@ describe("parseCommand", () => {
     expect(parseCommand("o")).toBeUndefined();
     expect(parseCommand("hello")).toBeUndefined();
     expect(parseCommand(".taskx no")).toBeUndefined();
+    expect(parseCommand(".statusx")).toBeUndefined();
+  });
+});
+
+describe("formatStatus", () => {
+  test("summarises gateway, pending, session and event age", () => {
+    const out = formatStatus({
+      gateway: true,
+      pending: 2,
+      session: "#1 C:\\work",
+      eventAgeMs: 12_000,
+      logs: ["a", "b"],
+    });
+    expect(out.split("\n")[0]).toBe("状态 | 网关 connected | 待审批 2 | 会话 #1 C:\\work | 事件 12s 前");
+  });
+
+  test("falls back when nothing is known", () => {
+    const out = formatStatus({ gateway: false, pending: 0, eventAgeMs: null, logs: [] });
+    expect(out).toBe("状态 | 网关 disconnected | 待审批 0 | 会话 无 | 事件 无");
+  });
+
+  test("keeps only the last N log lines", () => {
+    const logs = Array.from({ length: 30 }, (_, i) => `line${i}`);
+    const out = formatStatus({ gateway: true, pending: 0, logs, lines: 3 });
+    const tail = out.split("\n").slice(1).filter(Boolean);
+    expect(tail).toEqual(["line27", "line28", "line29"]);
   });
 });
 

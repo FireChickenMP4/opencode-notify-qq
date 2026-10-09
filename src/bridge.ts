@@ -57,8 +57,17 @@ function writeState(): void {
   }
 }
 
+/** How many recent log lines `.status` can show. */
+const LOG_RING = 50;
+
+/** Recent log lines (oldest first), for the `.status` command. */
+const recentLogs: string[] = [];
+
 function log(message: string): void {
-  console.log(`${new Date().toISOString()} [bridge] ${message}`);
+  const line = `${new Date().toISOString()} [bridge] ${message}`;
+  console.log(line);
+  recentLogs.push(line);
+  if (recentLogs.length > LOG_RING) recentLogs.splice(0, recentLogs.length - LOG_RING);
 }
 
 /** One-line preview of a command body for the log. */
@@ -172,7 +181,8 @@ export function parseReply(text: string): Verdict | undefined {
 
 export type Command =
   | { kind: "task" | "ask"; text: string; target?: number }
-  | { kind: "stop"; target?: number };
+  | { kind: "stop"; target?: number }
+  | { kind: "status"; target?: number };
 
 /**
  * Parse a leading-dot command. Returns undefined for anything else, so ordinary
@@ -181,15 +191,16 @@ export type Command =
  *   .task <text>      queue a message; runs after the current turn (or now if idle)
  *   .ask  <text>      steer into the running turn immediately
  *   .stop             abort the running turn (highest priority)
+ *   .status           report gateway/pending/session liveness + recent log
  *
  * Any command may name a session by number: `.stop #2`, `.task #1 do x`. The
  * leading dot accepts ASCII, full-width, or the Chinese ideographic full stop,
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|stop)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|stop|status)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop" | "status";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -201,13 +212,19 @@ export function parseCommand(text: string): Command | undefined {
     rest = (t[2] ?? "").trim();
   }
 
-  if (kind === "stop") return { kind, target };
+  if (kind === "stop" || kind === "status") return { kind, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
   return { kind, text: rest, target };
 }
 
 /** The session a command should act on: the most recent one we have seen. */
 let lastSessionID: string | null = null;
+
+/** Wall-clock of the most recent opencode event, for `.status` liveness. */
+let lastEventAt = 0;
+
+/** The live gateway client, set in run(); `.status` reads its connection state. */
+let gateway: QqBotClient | null = null;
 
 /** Stable short numbers so a phone reply can name a session (shared via file). */
 const sessionNumbers = new SessionNumbers(sessionNumbersPath());
@@ -345,7 +362,49 @@ async function drainQueue(sessionID: string): Promise<void> {
   }
 }
 
+/**
+ * Render the `.status` reply. Pure so the layout is testable.
+ *
+ * The first line is the liveness summary; the tail is recent bridge activity.
+ * Everything comes from in-memory state, so it works even when the bridge runs
+ * in the foreground with no log file.
+ */
+export function formatStatus(input: {
+  gateway: boolean;
+  pending: number;
+  session?: string;
+  eventAgeMs?: number | null;
+  logs: string[];
+  lines?: number;
+}): string {
+  const gw = input.gateway ? "connected" : "disconnected";
+  const age = input.eventAgeMs == null ? "无" : `${Math.round(input.eventAgeMs / 1000)}s 前`;
+  const head = `状态 | 网关 ${gw} | 待审批 ${input.pending} | 会话 ${input.session ?? "无"} | 事件 ${age}`;
+  const tail = input.logs.slice(-(input.lines ?? 15));
+  return [head, ...(tail.length ? ["", ...tail] : [])].join("\n");
+}
+
+/** Gather live state and reply with it. */
+async function sendStatus(): Promise<void> {
+  const dir = lastSessionID ? await sessionDirectory(lastSessionID) : undefined;
+  const num = lastSessionID ? sessionNumbers.lookup(lastSessionID) : undefined;
+  const session = dir ? (num !== undefined ? `#${num} ${dir}` : dir) : undefined;
+  const text = formatStatus({
+    gateway: gateway?.connected ?? false,
+    pending: pending.size,
+    session,
+    eventAgeMs: lastEventAt ? Date.now() - lastEventAt : null,
+    logs: recentLogs,
+  });
+  await sendText(text);
+  log("command: status");
+}
+
 async function runCommand(cmd: Command): Promise<void> {
+  if (cmd.kind === "status") {
+    await sendStatus();
+    return;
+  }
   const resolved = await resolveTarget(cmd.target);
   if (!resolved) {
     const why = cmd.target !== undefined ? `未知会话编号 #${cmd.target}` : "没有已知会话";
@@ -480,6 +539,8 @@ export function formatPermission(
 
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
+    lastEventAt = Date.now();
+
     // Keep the subagent set and number reclamation current before any numbering
     // decision (throttled internally).
     await refreshSessionRegistry();
@@ -698,6 +759,7 @@ async function run(): Promise<number> {
     onLog: (m) => log(`gateway: ${m}`),
     onEvent: (e) => void handleQqEvent(e),
   });
+  gateway = client;
   try {
     await client.connect();
   } catch (cause) {

@@ -233,6 +233,11 @@ export class QqBotClient {
     this.#options.onLog?.(message);
   }
 
+  /** 网关 WSS 是否处于打开状态（`.status` 用）。 */
+  get connected(): boolean {
+    return this.#ws?.readyState === WebSocket.OPEN;
+  }
+
   /** 取网关地址（通用 WSS 接入点）。 */
   async #getGatewayUrl(): Promise<string> {
     const cfg = requireConfig();
