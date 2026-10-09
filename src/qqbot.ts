@@ -222,6 +222,7 @@ export class QqBotClient {
   #sessionId: string | null = null;
   #lastSeq: number | null = null;
   #closed = false;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   readonly #options: QqBotClientOptions;
 
   constructor(options: QqBotClientOptions = {}) {
@@ -249,9 +250,33 @@ export class QqBotClient {
     return body.url;
   }
 
+  /**
+   * 安排一次重连，失败则继续安排。
+   *
+   * 它必须在“取网关地址失败”时也能触达：那一刻还没有 socket，下面的
+   * close 回调永远不会触发，否则守护进程会活着但永久掉线（网络抖动很常见）。
+   */
+  #scheduleReconnect(): void {
+    if (this.#closed || this.#options.autoReconnect === false) return;
+    if (this.#reconnectTimer) return;
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      void this.connect().catch((e) => {
+        this.#log(`reconnect failed: ${e}`);
+        this.#scheduleReconnect();
+      });
+    }, 3000);
+  }
+
   /** 建立连接并完成鉴权。返回一个在首次 Ready 前完成的 Promise。 */
   async connect(): Promise<void> {
-    const url = await this.#getGatewayUrl();
+    let url: string;
+    try {
+      url = await this.#getGatewayUrl();
+    } catch (cause) {
+      this.#scheduleReconnect();
+      throw cause;
+    }
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url);
       this.#ws = ws;
@@ -277,9 +302,7 @@ export class QqBotClient {
       ws.addEventListener("close", (ev) => {
         this.#log(`gateway closed (code=${(ev as CloseEvent).code})`);
         this.#clearHeartbeat();
-        if (!this.#closed && this.#options.autoReconnect !== false) {
-          setTimeout(() => void this.connect().catch((e) => this.#log(`reconnect failed: ${e}`)), 3000);
-        }
+        this.#scheduleReconnect();
       });
     });
   }
@@ -372,6 +395,10 @@ export class QqBotClient {
   /** 主动关闭，不再自动重连。 */
   close(): void {
     this.#closed = true;
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
     this.#clearHeartbeat();
     this.#ws?.close();
     this.#ws = null;
