@@ -500,6 +500,7 @@ async function sendStatus(target?: number): Promise<void> {
   const session = dir ? (resolved?.num !== undefined ? `#${resolved.num} ${dir}` : dir) : "无";
   const busy = id ? await sessionIsBusy(id) : false;
   const snap: SessionSnapshot = id ? await fetchSessionSnapshot(id) : { transcript: [] };
+  await reconcilePending();
 
   const text = formatStatus({
     session,
@@ -603,6 +604,47 @@ const CONFIRM: Record<Verdict, string> = {
   reject: "已拒绝 reject",
 };
 
+/** Send to QQ, retrying a few times so a transient blip never drops it. */
+async function sendWithRetry(content: string, attempts = 3): Promise<void> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await sendMarkdown(content);
+      return;
+    } catch (cause) {
+      last = cause;
+      await sleep(1000 * (i + 1));
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
+/**
+ * Drop pending entries the server no longer knows about.
+ *
+ * A permission can be answered in the TUI (or auto-allowed) at any time; the
+ * `permission.replied` event covers the common case, but a request that resolved
+ * before the bridge subscribed would linger first in the FIFO and make a later
+ * QQ reply hit a dead request. Best-effort: on error the map is left untouched.
+ */
+async function reconcilePending(): Promise<void> {
+  if (!pending.size) return;
+  try {
+    const res = await fetch(`${BASE}/permission`);
+    if (!res.ok) return;
+    const list = (await res.json()) as Array<{ id?: string; requestID?: string }>;
+    const live = new Set(list.map((p) => p.id ?? p.requestID).filter((v): v is string => !!v));
+    for (const id of [...pending.keys()]) {
+      if (!live.has(id)) {
+        pending.delete(id);
+        log(`pruned stale permission ${id}`);
+      }
+    }
+  } catch {
+    /* keep the map on failure */
+  }
+}
+
 /**
  * Render a permission request for QQ.
  *
@@ -656,13 +698,22 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
     lastEventAt = Date.now();
 
-    // Keep the subagent set and number reclamation current before any numbering
-    // decision (throttled internally).
-    await refreshSessionRegistry();
+    // A permission resolved elsewhere (approved in the TUI, auto-allowed) must
+    // leave the pending map, or a later QQ reply targets a dead request and 404s.
+    if (event.type === "permission.replied") {
+      const pid = event.properties?.permissionID;
+      if (typeof pid === "string" && pending.delete(pid)) {
+        log(`permission ${pid} resolved elsewhere; dropped from pending`);
+      }
+      return;
+    }
+
+    // Registry upkeep is best-effort: a transient server hiccup must never abort
+    // event handling.
+    await refreshSessionRegistry().catch(() => {});
 
     // Track the most recent session from ANY event, not just permissions:
-    // `.stop` / `.task` need a target even when no permission has fired. The
-    // number it returns is what the notification shows and a reply can name.
+    // `.stop` / `.task` need a target even when no permission has fired.
     const anySessionID = event.properties?.sessionID;
     if (typeof anySessionID === "string" && anySessionID) rememberSession(anySessionID);
 
@@ -684,12 +735,19 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
     const patterns = Array.isArray(p.patterns) ? p.patterns.map(String) : [];
     const metadata = (p.metadata ?? {}) as Record<string, unknown>;
 
+    // The QQ push is the point, so the directory lookup must not be able to
+    // throw past it (this is exactly how a subagent approval got dropped once).
     const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
-    const directory = await sessionDirectory(sessionID);
+    let directory = "(unknown)";
+    try {
+      if (sessionID) directory = await sessionDirectory(sessionID);
+    } catch {
+      /* keep "(unknown)" */
+    }
     const num = sessionID ? rememberSession(sessionID) : undefined;
 
     pending.set(requestID, { requestID, sessionID, permission });
-    await sendMarkdown(formatPermission(directory, permission, metadata, patterns, num));
+    await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num));
     log(`permission ${requestID} (${permission}) -> QQ`);
   } catch (cause) {
     log(`failed to handle permission: ${cause instanceof Error ? cause.message : cause}`);
@@ -712,21 +770,32 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
     const reply = parseReply(content);
     if (!reply) return; // unrelated chatter; stay silent
 
+    // Drop anything already resolved elsewhere before choosing the FIFO target.
+    const before = pending.size;
+    await reconcilePending();
+
     // FIFO: with several requests waiting, "o" must mean one unambiguous one.
     const target = pending.values().next().value as Pending | undefined;
     if (!target) {
-      log(`reply "${content.trim()}" ignored: no pending request`);
+      if (before > 0) await sendText("待处理的审批都已失效（可能已在电脑上处理）");
+      log(`reply "${content.trim()}" ignored: no live pending request`);
       return;
     }
-    pending.delete(target.requestID);
 
-    const res = await fetch(`${BASE}/permission/${target.requestID}/reply`, {
+    const res = await fetch(`${BASE}/session/${target.sessionID}/permissions/${target.requestID}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ reply }),
+      body: JSON.stringify({ response: reply }),
     });
+    if (res.status === 404) {
+      pending.delete(target.requestID);
+      await sendText(`该审批已失效（可能已在电脑上处理）· ${target.permission}`);
+      log(`permission ${target.requestID} already resolved; reply skipped`);
+      return;
+    }
     if (!res.ok) throw new Error(`reply failed: HTTP ${res.status}`);
 
+    pending.delete(target.requestID);
     await sendText(`${CONFIRM[reply]} · ${target.permission}`);
     log(`permission ${target.requestID} -> ${reply}`);
   } catch (cause) {
