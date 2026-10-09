@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { formatStatus, parseCommand, parseReply, promptPath } from "../src/bridge";
+import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, promptPath } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -104,28 +104,62 @@ describe("parseCommand", () => {
   });
 });
 
-describe("formatStatus", () => {
-  test("summarises gateway, pending, session and event age", () => {
+describe("status formatting", () => {
+  test("duration and age render compactly", () => {
+    expect(fmtDuration(45_000)).toBe("45s");
+    expect(fmtDuration(192_000)).toBe("3m12s");
+    expect(fmtDuration(3_720_000)).toBe("1h02m");
+    expect(fmtAgo(null)).toBe("无");
+    expect(fmtAgo(12_000)).toBe("12s 前");
+  });
+
+  test("busy session shows the running tool and flags a hung one", () => {
     const out = formatStatus({
+      session: "#1 E:\\repo",
       gateway: true,
-      pending: 2,
-      session: "#1 C:\\work",
-      eventAgeMs: 12_000,
-      logs: ["a", "b"],
+      pending: 0,
+      busy: true,
+      turnMs: 192_000,
+      tool: { name: "bash", command: "sleep 999", elapsedMs: 120_000 },
+      eventAgeMs: 5_000,
+      stuckMs: 90_000,
     });
-    expect(out.split("\n")[0]).toBe("状态 | 网关 connected | 待审批 2 | 会话 #1 C:\\work | 事件 12s 前");
+    const lines = out.split("\n");
+    expect(lines[0]).toBe("会话 #1 E:\\repo · 运行中 3m12s");
+    expect(lines[1]).toBe("当前 bash 已跑 2m00s  [>1m30s，可能卡住]");
+    expect(lines[2]).toBe("  sleep 999");
+    expect(lines[3]).toBe("事件 5s 前 | 待审批 0 | 网关 connected");
   });
 
-  test("falls back when nothing is known", () => {
-    const out = formatStatus({ gateway: false, pending: 0, eventAgeMs: null, logs: [] });
-    expect(out).toBe("状态 | 网关 disconnected | 待审批 0 | 会话 无 | 事件 无");
+  test("busy session with no live tool says so", () => {
+    const out = formatStatus({
+      session: "#1 E:\\repo",
+      gateway: true,
+      pending: 0,
+      busy: true,
+      turnMs: null,
+      tool: null,
+      eventAgeMs: 1_000,
+      stuckMs: 90_000,
+    });
+    const lines = out.split("\n");
+    expect(lines[0]).toBe("会话 #1 E:\\repo · 运行中");
+    expect(lines[1]).toBe("当前：无运行中的工具（可能在思考）");
   });
 
-  test("keeps only the last N log lines", () => {
-    const logs = Array.from({ length: 30 }, (_, i) => `line${i}`);
-    const out = formatStatus({ gateway: true, pending: 0, logs, lines: 3 });
-    const tail = out.split("\n").slice(1).filter(Boolean);
-    expect(tail).toEqual(["line27", "line28", "line29"]);
+  test("idle session reports last activity", () => {
+    const out = formatStatus({
+      session: "#1 E:\\repo",
+      gateway: false,
+      pending: 2,
+      busy: false,
+      lastActivityMs: 240_000,
+      eventAgeMs: 240_000,
+      stuckMs: 90_000,
+    });
+    const lines = out.split("\n");
+    expect(lines[0]).toBe("会话 #1 E:\\repo · 空闲");
+    expect(lines[1]).toBe("最后活动 4m00s 前 | 事件 4m00s 前 | 待审批 2 | 网关 disconnected");
   });
 });
 
