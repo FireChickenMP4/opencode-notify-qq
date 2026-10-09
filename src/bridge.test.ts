@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, promptPath } from "../src/bridge";
+import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, promptPath, renderTranscript } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -113,41 +113,67 @@ describe("status formatting", () => {
     expect(fmtAgo(12_000)).toBe("12s 前");
   });
 
-  test("busy session shows the running tool and flags a hung one", () => {
+  test("transcript labels reasoning, output and tools, skips user text", () => {
+    const out = renderTranscript([
+      { info: { role: "user" }, parts: [{ type: "text", text: "hi there" }] },
+      {
+        info: { role: "assistant" },
+        parts: [
+          { type: "step-start" },
+          { type: "reasoning", text: "let me think" },
+          { type: "text", text: "here is the answer" },
+          { type: "tool", tool: "edit", state: { status: "completed", title: "app/x.go" } },
+        ],
+      },
+    ]);
+    expect(out).toEqual([
+      "思考> let me think",
+      "输出> here is the answer",
+      "工具> edit [完成] app/x.go",
+    ]);
+  });
+
+  test("a running tool carries its elapsed time and the stuck flag", () => {
+    const start = Date.now() - 120_000;
+    const out = renderTranscript([
+      {
+        info: { role: "assistant" },
+        parts: [{ type: "tool", tool: "bash", state: { status: "running", input: { command: "sleep 999" }, time: { start } } }],
+      },
+    ]);
+    expect(out[0]).toContain("bash [运行中");
+    expect(out[0]).toContain("可能卡住");
+    expect(out[0]).toContain("sleep 999");
+  });
+
+  test("keeps only the last maxLines transcript lines", () => {
+    const parts = Array.from({ length: 5 }, (_, i) => ({
+      type: "tool",
+      tool: "bash",
+      state: { status: "completed", title: `c${i}` },
+    }));
+    const out = renderTranscript([{ info: { role: "assistant" }, parts }], 3);
+    expect(out).toEqual(["工具> bash [完成] c2", "工具> bash [完成] c3", "工具> bash [完成] c4"]);
+  });
+
+  test("header line plus transcript tail", () => {
     const out = formatStatus({
       session: "#1 E:\\repo",
       gateway: true,
       pending: 0,
       busy: true,
       turnMs: 192_000,
-      tool: { name: "bash", command: "sleep 999", elapsedMs: 120_000 },
       eventAgeMs: 5_000,
-      stuckMs: 90_000,
+      transcript: ["思考> a", "工具> bash [运行中] x"],
+      lines: 15,
     });
     const lines = out.split("\n");
-    expect(lines[0]).toBe("会话 #1 E:\\repo · 运行中 3m12s");
-    expect(lines[1]).toBe("当前 bash 已跑 2m00s  [>1m30s，可能卡住]");
-    expect(lines[2]).toBe("  sleep 999");
-    expect(lines[3]).toBe("事件 5s 前 | 待审批 0 | 网关 connected");
+    expect(lines[0]).toBe("会话 #1 E:\\repo · 运行中 3m12s | 事件 5s 前 | 待审批 0 | 网关 connected");
+    expect(lines[1]).toBe("思考> a");
+    expect(lines[2]).toBe("工具> bash [运行中] x");
   });
 
-  test("busy session with no live tool says so", () => {
-    const out = formatStatus({
-      session: "#1 E:\\repo",
-      gateway: true,
-      pending: 0,
-      busy: true,
-      turnMs: null,
-      tool: null,
-      eventAgeMs: 1_000,
-      stuckMs: 90_000,
-    });
-    const lines = out.split("\n");
-    expect(lines[0]).toBe("会话 #1 E:\\repo · 运行中");
-    expect(lines[1]).toBe("当前：无运行中的工具（可能在思考）");
-  });
-
-  test("idle session reports last activity", () => {
+  test("idle header shows last activity", () => {
     const out = formatStatus({
       session: "#1 E:\\repo",
       gateway: false,
@@ -155,11 +181,9 @@ describe("status formatting", () => {
       busy: false,
       lastActivityMs: 240_000,
       eventAgeMs: 240_000,
-      stuckMs: 90_000,
+      transcript: [],
     });
-    const lines = out.split("\n");
-    expect(lines[0]).toBe("会话 #1 E:\\repo · 空闲");
-    expect(lines[1]).toBe("最后活动 4m00s 前 | 事件 4m00s 前 | 待审批 2 | 网关 disconnected");
+    expect(out).toBe("会话 #1 E:\\repo · 空闲（最后活动 4m00s 前） | 事件 4m00s 前 | 待审批 2 | 网关 disconnected");
   });
 });
 

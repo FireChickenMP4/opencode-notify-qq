@@ -368,51 +368,90 @@ export function fmtAgo(ms: number | null | undefined): string {
   return ms == null ? "无" : `${fmtDuration(ms)} 前`;
 }
 
-/** How long a running tool may run before `.status` flags it as possibly stuck. */
+/** How long a running tool may run before its line is flagged as possibly stuck. */
 const STUCK_MS = Number(process.env.OPENCODE_NOTIFY_QQ_STUCK_MS ?? 90_000);
 
-/** A tool mid-execution - the "is it stuck?" signal. */
-type LiveTool = { name: string; command?: string; elapsedMs?: number | null };
+/** Default number of transcript lines `.status` shows. */
+const STATUS_LINES = Number(process.env.OPENCODE_NOTIFY_QQ_STATUS_LINES ?? 15);
 
-type SessionLive = { busy: boolean; turnStart?: number; tool?: LiveTool | null; lastActivity?: number };
+/** Max lines one text/reasoning part may contribute. */
+const PART_LINES = 4;
+
+/** Max characters per transcript line. */
+const LINE_CHARS = 120;
+
+type Part = {
+  type?: string;
+  text?: string;
+  tool?: string;
+  state?: { status?: string; title?: string; input?: { command?: string }; time?: { start?: number } };
+};
+type Msg = { info?: { role?: string; time?: { created?: number; completed?: number } }; parts?: Part[] };
+
+/** Wrap a text blob into trimmed, capped display lines. */
+function clipLines(text: string): string[] {
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => (l.length > LINE_CHARS ? `${l.slice(0, LINE_CHARS)}…` : l));
+  if (lines.length <= PART_LINES) return lines;
+  return [...lines.slice(0, PART_LINES - 1), "…"];
+}
+
+/** One "工具> ..." line: name, status/timeout flag, and command or file. */
+function toolLine(p: Part): string {
+  const status = p.state?.status;
+  const start = p.state?.time?.start;
+  let label: string;
+  if (status === "running") {
+    const ms = typeof start === "number" ? Date.now() - start : null;
+    label = `运行中${ms != null ? ` ${fmtDuration(ms)}` : ""}${ms != null && ms > STUCK_MS ? "，可能卡住" : ""}`;
+  } else if (status === "pending") {
+    label = "排队";
+  } else if (status === "error") {
+    label = "失败";
+  } else {
+    label = "完成";
+  }
+  const raw = typeof p.state?.input?.command === "string" ? p.state.input.command : p.state?.title;
+  const detail = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim().slice(0, 160) : "";
+  return `${p.tool ?? "?"} [${label}]${detail ? ` ${detail}` : ""}`;
+}
 
 /**
- * Ask opencode what the session is doing, and since when.
+ * Turn the session's recent messages into labeled transcript lines.
  *
- * `busy` comes from /session/status; a running tool (with its start time) comes
- * from the newest messages' tool parts - that elapsed clock is what tells a hung
- * bash from a merely long one.
+ * Pure, so the mapping is testable without a server. Reasoning and assistant
+ * text get "思考>" / "输出>" so it is obvious which is which; tools get a single
+ * line with their status. User text is skipped (you already know what you sent).
  */
-async function fetchSessionLive(sessionID: string): Promise<SessionLive> {
-  const busy = await sessionIsBusy(sessionID);
-  try {
-    const res = await fetch(`${BASE}/session/${sessionID}/message?limit=10`);
-    if (!res.ok) return { busy, tool: null };
-    const msgs = (await res.json()) as Array<{
-      info?: { role?: string; time?: { created?: number; completed?: number } };
-      parts?: Array<{
-        type?: string;
-        tool?: string;
-        state?: { status?: string; title?: string; input?: { command?: string }; time?: { start?: number } };
-      }>;
-    }>;
-
-    let tool: LiveTool | null = null;
-    for (let i = msgs.length - 1; i >= 0 && !tool; i--) {
-      for (const p of msgs[i]?.parts ?? []) {
-        const status = p?.state?.status;
-        if (p?.type === "tool" && (status === "running" || status === "pending")) {
-          const raw = typeof p.state?.input?.command === "string" ? p.state.input.command : p.state?.title;
-          const command = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim().slice(0, 200) : undefined;
-          const start = p.state?.time?.start;
-          tool = {
-            name: String(p.tool ?? "?"),
-            ...(command ? { command } : {}),
-            elapsedMs: typeof start === "number" ? Date.now() - start : null,
-          };
-        }
+export function renderTranscript(msgs: Msg[], maxLines = STATUS_LINES): string[] {
+  const lines: string[] = [];
+  for (const m of msgs) {
+    const isUser = m.info?.role === "user";
+    for (const p of m.parts ?? []) {
+      if (p.type === "reasoning" && p.text) {
+        for (const l of clipLines(p.text)) lines.push(`思考> ${l}`);
+      } else if (p.type === "text" && p.text) {
+        if (isUser) continue;
+        for (const l of clipLines(p.text)) lines.push(`输出> ${l}`);
+      } else if (p.type === "tool") {
+        lines.push(`工具> ${toolLine(p)}`);
       }
     }
+  }
+  return lines.slice(-maxLines);
+}
+
+type SessionSnapshot = { transcript: string[]; turnStart?: number; lastActivity?: number };
+
+/** Fetch recent messages and derive the transcript plus turn/last-activity times. */
+async function fetchSessionSnapshot(sessionID: string): Promise<SessionSnapshot> {
+  try {
+    const res = await fetch(`${BASE}/session/${sessionID}/message?limit=10`);
+    if (!res.ok) return { transcript: [] };
+    const msgs = (await res.json()) as Msg[];
 
     let turnStart: number | undefined;
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -423,15 +462,15 @@ async function fetchSessionLive(sessionID: string): Promise<SessionLive> {
     }
     const last = msgs[msgs.length - 1];
     const lastActivity = last?.info?.time?.completed ?? last?.info?.time?.created;
-    return { busy: busy || !!tool, turnStart, tool, lastActivity };
+    return { transcript: renderTranscript(msgs), turnStart, lastActivity };
   } catch {
-    return { busy, tool: null };
+    return { transcript: [] };
   }
 }
 
 /**
- * Render the `.status` reply. Pure so the layout is testable: the first line is
- * the turn state, then the running tool, then a one-line health summary.
+ * Render the `.status` reply. Pure so the layout is testable: a one-line state
+ * header, then the last `lines` transcript lines.
  */
 export function formatStatus(input: {
   session: string;
@@ -439,27 +478,18 @@ export function formatStatus(input: {
   pending: number;
   busy: boolean;
   turnMs?: number | null;
-  tool?: LiveTool | null;
   eventAgeMs?: number | null;
   lastActivityMs?: number | null;
-  stuckMs: number;
+  transcript: string[];
+  lines?: number;
 }): string {
+  const stateText = input.busy
+    ? `运行中${input.turnMs != null ? ` ${fmtDuration(input.turnMs)}` : ""}`
+    : `空闲${input.lastActivityMs != null ? `（最后活动 ${fmtDuration(input.lastActivityMs)} 前）` : ""}`;
   const health = `事件 ${fmtAgo(input.eventAgeMs)} | 待审批 ${input.pending} | 网关 ${input.gateway ? "connected" : "disconnected"}`;
-  if (!input.busy) {
-    return [`会话 ${input.session} · 空闲`, `最后活动 ${fmtAgo(input.lastActivityMs)} | ${health}`].join("\n");
-  }
-  const head = `会话 ${input.session} · 运行中${input.turnMs != null ? ` ${fmtDuration(input.turnMs)}` : ""}`;
-  const lines = [head];
-  if (input.tool) {
-    const el = input.tool.elapsedMs ?? null;
-    const warn = el != null && el > input.stuckMs ? `  [>${fmtDuration(input.stuckMs)}，可能卡住]` : "";
-    lines.push(`当前 ${input.tool.name} 已跑${el != null ? ` ${fmtDuration(el)}` : ""}${warn}`);
-    if (input.tool.command) lines.push(`  ${input.tool.command}`);
-  } else {
-    lines.push("当前：无运行中的工具（可能在思考）");
-  }
-  lines.push(health);
-  return lines.join("\n");
+  const head = `会话 ${input.session} · ${stateText} | ${health}`;
+  const tail = input.transcript.slice(-(input.lines ?? STATUS_LINES));
+  return [head, ...tail].join("\n");
 }
 
 /** Gather live state and reply with it. */
@@ -468,18 +498,18 @@ async function sendStatus(target?: number): Promise<void> {
   const id = resolved?.id ?? null;
   const dir = id ? await sessionDirectory(id) : undefined;
   const session = dir ? (resolved?.num !== undefined ? `#${resolved.num} ${dir}` : dir) : "无";
-  const live: SessionLive = id ? await fetchSessionLive(id) : { busy: false, tool: null };
+  const busy = id ? await sessionIsBusy(id) : false;
+  const snap: SessionSnapshot = id ? await fetchSessionSnapshot(id) : { transcript: [] };
 
   const text = formatStatus({
     session,
     gateway: gateway?.connected ?? false,
     pending: pending.size,
-    busy: live.busy,
-    turnMs: live.busy && live.turnStart ? Date.now() - live.turnStart : null,
-    tool: live.tool,
+    busy,
+    turnMs: busy && snap.turnStart ? Date.now() - snap.turnStart : null,
     eventAgeMs: lastEventAt ? Date.now() - lastEventAt : null,
-    lastActivityMs: live.lastActivity != null ? Date.now() - live.lastActivity : lastEventAt ? Date.now() - lastEventAt : null,
-    stuckMs: STUCK_MS,
+    lastActivityMs: snap.lastActivity != null ? Date.now() - snap.lastActivity : null,
+    transcript: snap.transcript,
   });
   await sendText(text);
   log("command: status");
