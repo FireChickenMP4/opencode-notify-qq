@@ -22,6 +22,7 @@
 import { writeFileSync } from "node:fs";
 import { OpenCode } from "@opencode/client/promise";
 import { headers, Service } from "@opencode/client/service";
+import { markCommandOutcome } from "./command-outcome";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
 import { SessionNumbers, sessionNumbersPath } from "./sessions";
@@ -387,6 +388,9 @@ async function drainQueue(sessionID: string): Promise<void> {
   draining.add(sessionID);
   try {
     await prompt(sessionID, text);
+    // The queued command started this turn, so its result is a reply: mark it
+    // before the turn ends, for the plugin to report regardless of the switch.
+    markCommandOutcome(sessionID);
     taskQueue.shift(sessionID);
     const rest = taskQueue.size(sessionID);
     const num = sessionNumbers.lookup(sessionID);
@@ -618,6 +622,7 @@ async function runCommand(cmd: Command): Promise<void> {
     if (cmd.kind === "ask") {
       // .ask means "steer into the running turn"; the default delivery does that.
       await prompt(target, cmd.text);
+      markCommandOutcome(target);
       await sendText(`已插话 ${tag}: ${cmd.text.slice(0, 80)}`);
       log(`ask steered into ${target}: ${preview(cmd.text)}`);
       return;
@@ -632,6 +637,7 @@ async function runCommand(cmd: Command): Promise<void> {
       return;
     }
     await prompt(target, cmd.text);
+    markCommandOutcome(target);
     await sendText(`已发送 ${tag}: ${cmd.text.slice(0, 80)}`);
     log(`task sent now (idle) to ${target}: ${preview(cmd.text)}`);
   } catch (cause) {

@@ -236,3 +236,12 @@ bridge 必须单例的原因。
   （V2 里 agent 是会话属性）。**这一条未实测**，若 `.task` 不生效先看这里。
 - **诊断**：`.stop` / `.task` / `.btw` / `.status` 的用法不变；`--check` 现在校验的是
   「服务发现 + 鉴权 + 待审批列表」。
+
+
+### 命令结果回推（bot 语义）
+
+.task / .ask 注入的那一轮结束时**一定**把结果推回 QQ，即使 wayNotify 关着：
+命令的结果是「回复」，不是单向推送。实现：bridge 注入后写标记
+（%TEMP%/opencode-notify/qq-command/<sessionID>），插件在回合结束时消费它并据此放行；
+只有插件一侧发送，所以开关开着时也不会与自动推送重复（幂等）。标记带 TTL，
+默认 6 小时，OPENCODE_NOTIFY_QQ_OUTCOME_TTL_MS 可调。

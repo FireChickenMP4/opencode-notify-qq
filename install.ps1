@@ -34,7 +34,7 @@ New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
 # The plugin file keeps a single default export; helpers live in src/.
 $modules = @(
     "qqbot.ts", "config.ts", "sessions.ts", "task-queue.ts",
-    "deliver.ts", "bash-watch.ts", "notify-helpers.ts", "bridge.ts"
+    "deliver.ts", "bash-watch.ts", "notify-helpers.ts", "command-outcome.ts", "bridge.ts"
 )
 foreach ($m in $modules) {
     Copy-Item (Join-Path $repo "src\$m") (Join-Path $srcDir $m) -Force

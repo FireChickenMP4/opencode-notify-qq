@@ -44,6 +44,24 @@ const {
   throw new Error("notify-qq: cannot locate notify-helpers.ts");
 })();
 
+/**
+ * Consume "this turn is a remote command's result" marks.
+ *
+ * Missing module (older install) degrades to the away switch deciding, which is
+ * the pre-existing behaviour.
+ */
+const takeCommandOutcome = await (async (): Promise<(sessionID: string) => boolean> => {
+  for (const p of ["./notify-qq/command-outcome.ts", "../src/command-outcome.ts"]) {
+    try {
+      const mod = (await import(p)) as { takeCommandOutcome: (id: string) => boolean };
+      return mod.takeCommandOutcome;
+    } catch {
+      continue;
+    }
+  }
+  return () => false;
+})();
+
 /** Where the auto-spawned bridge writes stdout+stderr. */
 const BRIDGE_LOG = join(HERE, "bridge.log");
 
@@ -627,7 +645,11 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
       return;
     }
 
-    if (!awayEnabled()) {
+    // A command's result is a reply, not an unsolicited push: it goes out even
+    // with the away switch off. Consuming the mark here is also what stops the
+    // same turn from being reported twice when the switch is on.
+    const viaCommand = sessionID ? takeCommandOutcome(sessionID) : false;
+    if (!viaCommand && !awayEnabled()) {
       trace("turn end skipped: awayNotify is off");
       return;
     }
