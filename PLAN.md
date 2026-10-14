@@ -430,3 +430,15 @@ fork 抢走了会话编号（`.status` 显示成了 `#3`，`.ask #3` 真的打�
   解释的空档、中断的分支也点不着。
 - **部署副作用**（运维提醒）：每次部署都会重启 bridge ⇒ 正在跑的旁问会丢（答案不回推，现在还会被清扫）。
   所以改完要部署时，先确认没有在跑的旁问；纯文档改动不要 `install`/重载。
+
+
+### 审批 / 提问改为跟随 awayNotify（用户要求）
+
+早先的语义是「需要回应的不受开关管」；用户实测后不喜欢它推手机 —— 他在电脑前时 TUI 本来就会弹
+审批/提问（05:53 那次他就是在 TUI 里批掉的，bridge 日志写着 `resolved elsewhere; dropped from pending`）。
+
+现在：**bridge 仍然把请求记进 `pending`**（旁问等待、`.answer`、QQ 回复都要用它），但**推送与否看
+`awayNotify`** —— 关着就只由 TUI 弹窗问；开着才推 QQ。email 侧同样改回来（权限/提问邮件也受
+`awayNotify` 管）；win 有自己的开关（`notify-windows.json`），管它全部 toast，不动。
+
+注意取舍：`awayNotify` 关着且你离开了电脑时，审批会一直等你（TUI 弹窗还在，回来就能批）。

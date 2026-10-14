@@ -1415,8 +1415,10 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
       return;
     }
 
-    // A question is the other thing that blocks the run, and the bridge is what
-    // answers it (`.answer`), so it pushes it too - not gated by the away switch.
+    // A question blocks the run and the bridge is what answers it (`.answer`), so
+    // it is tracked here either way - but the push follows the away switch: while
+    // the user is at the computer the TUI shows it, and awayNotify is what says
+    // they are not.
     if (type === "form.created") {
       const form = data.form as { id?: string; sessionID?: string; title?: string; fields?: FormField[] } | undefined;
       const formID = asString(form?.id);
@@ -1427,6 +1429,11 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
       const question = questionOf(form);
       pendingForms.set(formID, { formID, sessionID, question, fields });
       if (sessionID) rememberSession(sessionID);
+
+      if (!loadConfig().awayNotify) {
+        log(`form ${formID} (${question.slice(0, 40)}) not pushed (awayNotify off)`);
+        return;
+      }
 
       // The push is the point, so the directory lookup must not throw past it.
       let directory = "(unknown)";
@@ -1478,8 +1485,14 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
     const aside = anySessionID ? asideIds.has(anySessionID) || asideSeen.has(anySessionID) : false;
 
     pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
-    await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
-    log(`permission ${requestID} (${permission}) -> QQ`);
+    // Tracked above either way (the aside wait and the QQ reply both use it); the
+    // push itself follows the away switch, so at the computer only the TUI asks.
+    if (loadConfig().awayNotify) {
+      await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
+      log(`permission ${requestID} (${permission}) -> QQ`);
+    } else {
+      log(`permission ${requestID} (${permission}) not pushed (awayNotify off)`);
+    }
   } catch (cause) {
     log(`failed to handle permission: ${cause instanceof Error ? cause.message : cause}`);
   }
