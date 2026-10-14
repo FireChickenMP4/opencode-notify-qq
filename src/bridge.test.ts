@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { asideFraming, asideRules, asideVisibleInList, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
+import { asideFraming, asideRules, asideVisibleInList, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, liveRequestIds, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -402,6 +402,23 @@ describe("asideVisibleInList", () => {
 
   test("an unknown timestamp is treated as old", () => {
     expect(asideVisibleInList({}, now, false)).toBe(false);
+  });
+});
+
+describe("liveRequestIds", () => {
+  test("reads a bare array (what this endpoint really returns)", () => {
+    expect([...liveRequestIds([{ id: "a" }, { id: "b" }])]).toEqual(["a", "b"]);
+  });
+
+  test("also reads an envelope, for endpoints that use one", () => {
+    expect([...liveRequestIds({ data: [{ id: "c" }] })]).toEqual(["c"]);
+  });
+
+  test("empty and garbage give nothing", () => {
+    expect(liveRequestIds([]).size).toBe(0);
+    expect(liveRequestIds(null).size).toBe(0);
+    expect(liveRequestIds({ nope: 1 }).size).toBe(0);
+    expect(liveRequestIds([{ noId: true }, "x"]).size).toBe(0);
   });
 });
 

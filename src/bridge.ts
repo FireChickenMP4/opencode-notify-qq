@@ -1156,19 +1156,37 @@ async function sendWithRetry(content: string, attempts = 3): Promise<void> {
  * before the bridge subscribed would linger first in the FIFO and make a later
  * QQ reply hit a dead request. Best-effort: on error the map is left untouched.
  */
+/**
+ * The request ids in whatever `permission.request.list` returned: V2 here answers
+ * `{ location, data }`, but accept a bare array too rather than trust one shape.
+ */
+export function liveRequestIds(raw: unknown): Set<string> {
+  const list = Array.isArray(raw) ? raw : ((raw as { data?: readonly unknown[] } | null)?.data ?? []);
+  const ids = new Set<string>();
+  for (const item of list) {
+    const id = (item as { id?: unknown })?.id;
+    if (typeof id === "string" && id) ids.add(id);
+  }
+  return ids;
+}
+
 async function reconcilePending(): Promise<void> {
   if (!pending.size) return;
-  try {
-    const list = await client().permission.request.list({});
-    const live = new Set((list.data ?? []).map((p) => p.id).filter((v): v is string => !!v));
-    for (const id of [...pending.keys()]) {
-      if (!live.has(id)) {
-        pending.delete(id);
-        log(`pruned stale permission ${id}`);
-      }
+  // This endpoint takes a location and answers `{ location, data }`. Pruning is
+  // deliberately conservative: only a NON-empty answer may mark a request dead.
+  // (Treating an empty answer as "gone" turned every QQ approval into "expired".)
+  for (const [id, p] of [...pending]) {
+    const directory = await sessionDirectory(p.sessionID).catch(() => "");
+    let live: Set<string>;
+    try {
+      live = liveRequestIds(await client().permission.request.list({ location: { directory } }));
+    } catch {
+      continue;
     }
-  } catch {
-    /* keep the map on failure */
+    if (live.size > 0 && !live.has(id)) {
+      pending.delete(id);
+      log(`pruned stale permission ${id}`);
+    }
   }
 }
 
@@ -1441,9 +1459,14 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
       });
     } catch (cause) {
       // A request answered elsewhere between the liveness check and the reply is
-      // gone for good: say so instead of reporting a hard failure.
-      const list = await client().permission.request.list({}).catch(() => null);
-      const stillLive = list?.data?.some((p) => p.id === target.requestID) ?? false;
+      // gone for good: say so instead of reporting a hard failure. Only a non-empty
+      // answer that lacks the id proves it - an empty one proves nothing.
+      const directory = await sessionDirectory(target.sessionID).catch(() => "");
+      const list = await client()
+        .permission.request.list({ location: { directory } })
+        .catch(() => null);
+      const live = list ? liveRequestIds(list) : null;
+      const stillLive = live === null || live.size === 0 || live.has(target.requestID);
       if (stillLive) throw cause;
       pending.delete(target.requestID);
       await sendText(`该审批已失效（可能已在电脑上处理）· ${target.permission}`);
