@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { asideFraming, asideRules, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
+import { asideFraming, asideRules, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -47,6 +47,21 @@ describe("parseReply", () => {
     expect(parseReply(".task fix the bug")).toBeUndefined();
     expect(parseReply("hello")).toBeUndefined();
     expect(parseReply("")).toBeUndefined();
+  });
+
+  test("a trailing #N is stripped, so `.a #2` still reads as always", () => {
+    expect(parseReply(".a #2")).toBe("always");
+    expect(parseReply("o #3")).toBe("once");
+    expect(parseReply(".r#7")).toBe("reject");
+  });
+});
+
+describe("replyTarget", () => {
+  test("reads the optional session number, and nothing else", () => {
+    expect(replyTarget(".a #2")).toBe(2);
+    expect(replyTarget("r # 12")).toBe(12);
+    expect(replyTarget(".o")).toBeUndefined();
+    expect(replyTarget("hello")).toBeUndefined();
   });
 });
 

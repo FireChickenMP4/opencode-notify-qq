@@ -135,6 +135,11 @@ async function allSessions(): Promise<Session[]> {
       directory: s.location?.directory,
       agent: s.agent,
       parentID: s.parentID,
+      // Everything `.list` and the aside labels show: dropping these made every
+      // row look like a bare directory.
+      title: (s as { title?: string }).title,
+      metadata: (s as { metadata?: { aside?: boolean } }).metadata,
+      time: (s as { time?: { created?: number; updated?: number } }).time,
     }));
     sessionsAt = Date.now();
   }
@@ -229,8 +234,14 @@ const REPLY_ALIASES: Record<string, Verdict> = {
   拒绝: "reject",
 };
 
+/// The optional "#N" a reply carries: `.a #2` answers session #2's request.
+export function replyTarget(text: string): number | undefined {
+  const m = text.match(/#\s*(\d+)\b/);
+  return m ? Number(m[1]) : undefined;
+}
+
 export function parseReply(text: string): Verdict | undefined {
-  const key = text.trim().replace(/^[.．。]/, "").trim().toLowerCase();
+  const key = text.trim().replace(/^[.．。]/, "").trim().toLowerCase().replace(/#\s*\d+\s*$/, "").trim();
   return REPLY_ALIASES[key];
 }
 
@@ -322,9 +333,10 @@ const draining = new Set<string>();
  * lastSessionID so untargeted commands hit the session that is actually active.
  */
 function rememberSession(sessionID: string): number | undefined {
-  // Our own aside fork: keep it out of the numbering and hand every untagged
-  // command back to the session the user actually means.
-  if (asideIds.has(sessionID) || asideSeen.has(sessionID)) return undefined;
+  // Our own aside fork: it may be named (`.stop #N`) while it runs, but it must
+  // not become the default target - an untagged command still means the session
+  // the user is actually looking at.
+  if (asideIds.has(sessionID) || asideSeen.has(sessionID)) return sessionNumbers.numberFor(sessionID);
   lastSessionID = sessionID;
   if (subagentIds.has(sessionID)) return undefined;
   return sessionNumbers.numberFor(sessionID);
@@ -394,7 +406,7 @@ async function refreshSessionRegistry(): Promise<void> {
     .sort((a, b) => ((b as { time?: { updated?: number } }).time?.updated ?? 0) - ((a as { time?: { updated?: number } }).time?.updated ?? 0))
     .slice(0, NUMBER_WINDOW)
     .map((s) => s.id);
-  sessionNumbers.prune(new Set(recent));
+  sessionNumbers.prune(new Set([...recent, ...asideSeen]));
 }
 
 /**
@@ -725,7 +737,8 @@ export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePromp
     "【QQ 旁问】用户不在电脑前，你这段回答会作为一条 QQ 消息直接推到他手机上。请照这个来写：",
     "1. 先给结论，再给必要的依据；手机屏幕小，能短就短，不要贴大段代码或长表格；",
     "2. 不要复述问题、不要汇报过程、不要给「下一步计划」，也不要反问「要不要我继续」；",
-    "3. 用中文，把话说清楚，别堆术语。",
+    "3. 用户问的多半是「这是什么 / 为什么 / 怎么办」—— 直接回答即可：不要为了回答去改文件、跑命令或做实验（需要动手的，他会用 .ask / .task）；",
+    "4. 用中文，把话说清楚，别堆术语。",
   ].join("\n");
   const tools =
     kind === "btw"
@@ -822,15 +835,18 @@ async function sendStatus(target?: number): Promise<void> {
  */
 async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<void> {
   let forkID: string | undefined;
+  let forkNum: number | undefined;
   try {
     const fork = await client().session.fork({ sessionID: target });
     forkID = fork?.id;
     if (!forkID) throw new Error("fork 没有返回会话 id");
 
-    // Register before anything else can report it: to us a fork must never look
-    // like a session of its own, and the metadata is what the plugin reads to
-    // stay quiet about it.
+    // Register before anything else can report it: to us a fork must never become
+    // the default target, and the metadata is what the plugins read to stay quiet
+    // about it. It does get a number, so the ack can name the branch.
     asideIds.add(forkID);
+    forkNum = rememberSession(forkID);
+    await sendText(`旁问(工具)已发出：分支 #${forkNum} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
 
     const config = loadConfig();
     const sandbox = asideSandbox(forkID);
@@ -871,11 +887,11 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
       : finished
         ? "(没有内容)"
         : "(超时 —— 这一轮还没答完，先用 .status 看看)";
-    // Name the session the question was asked about: the fork is throwaway, so
-    // the target's number is the thing a reply can address.
-    const asideNum = num ?? sessionNumbers.numberFor(target);
-    const heading = `**opencode · 旁问(工具) · #${asideNum}**`;
-    await sendWithRetry(`${heading}\n\n\`${tag}\` ${question.slice(0, 80)}\n\n---\n\n${body}`);
+    // Name the session the question was asked about, and the branch it runs in:
+    // the branch is throwaway but addressable (`.stop #N`) while it works.
+    const asked = num !== undefined ? `问 #${num}` : "问当前会话";
+    const heading = `**opencode · 旁问(工具) · ${asked}**`;
+    await sendWithRetry(`${heading}\n\n\`分支 #${forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${body}`);
     log(`bt answered for ${target} via ${forkID} (${finished ? "done" : "timeout"}): ${preview(question)}`);
   } catch (cause) {
     const why = cause instanceof Error ? cause.message : String(cause);
@@ -927,9 +943,8 @@ async function runCommand(cmd: Command): Promise<void> {
     // question understands what you were talking about), let it read and search,
     // then throw the fork away. Detached, because `.stop` must stay responsive.
     if (cmd.kind === "bt") {
-      const question = cmd.text;
-      await sendText(`旁问(工具)已发出 ${tag}，跑完回你：${question.slice(0, 80)}`);
-      void runAside(target, num, tag, question);
+      // The ack goes out once the fork exists, so it can name the branch number.
+      void runAside(target, num, tag, cmd.text);
       return;
     }
 
@@ -1113,7 +1128,7 @@ export function formatPermission(
     lines.push("", "```sh", String(command).trim(), "```");
   }
 
-  lines.push("", "回复  **.o**=once  **.a**=always(记住)  **.r**=reject");
+  lines.push("", "回复  **.o**=once  **.a**=always(记住)  **.r**=reject（指名会话：`.o #2`）");
   return lines.join("\n");
 }
 
@@ -1301,6 +1316,7 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
       return;
     }
 
+    const wantFor = replyTarget(content);
     const reply = parseReply(content);
     if (!reply) return; // unrelated chatter; stay silent
 
@@ -1308,8 +1324,12 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
     const before = pending.size;
     await reconcilePending();
 
-    // FIFO: with several requests waiting, "o" must mean one unambiguous one.
-    const target = pending.values().next().value as Pending | undefined;
+    // "#N" answers that session's requests (a branch can have several in flight).
+    // Without it, FIFO: with several waiting, "o" must mean one unambiguous one.
+    const forSession = wantFor !== undefined ? sessionNumbers.resolve(wantFor) : undefined;
+    const target = (forSession
+      ? [...pending.values()].find((p) => p.sessionID === forSession)
+      : pending.values().next().value) as Pending | undefined;
     if (!target) {
       if (before > 0) await sendText("待处理的审批都已失效（可能已在电脑上处理）");
       log(`reply "${content.trim()}" ignored: no live pending request`);
@@ -1335,7 +1355,8 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
     }
 
     pending.delete(target.requestID);
-    await sendText(`${CONFIRM[reply]} · ${target.permission}`);
+    const doneNum = sessionNumbers.lookup(target.sessionID);
+    await sendText(`${CONFIRM[reply]} · ${target.permission}${doneNum !== undefined ? ` · #${doneNum}` : ""}`);
     log(`permission ${target.requestID} -> ${reply}`);
   } catch (cause) {
     log(`failed to handle QQ reply: ${cause instanceof Error ? cause.message : cause}`);
