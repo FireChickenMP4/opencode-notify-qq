@@ -495,6 +495,8 @@ const STUCK_MS = Number(process.env.OPENCODE_NOTIFY_QQ_STUCK_MS ?? 90_000);
 const STATUS_LINES = Number(process.env.OPENCODE_NOTIFY_QQ_STATUS_LINES ?? 15);
 /** How many sessions `.list` shows at most (recent first). */
 const LIST_LINES = Number(process.env.OPENCODE_NOTIFY_QQ_LIST_LINES ?? 8);
+/** How long a finished aside branch still shows in `.list` (it holds a number). */
+const ASIDE_LIST_MS = Number(process.env.OPENCODE_NOTIFY_QQ_ASIDE_LIST_MS ?? 600_000);
 
 /** Max lines one text/reasoning part may contribute. */
 const PART_LINES = 4;
@@ -803,24 +805,43 @@ export function formatStatus(input: {
 }
 
 /** Gather live state and reply with it. */
+/**
+ * Should this aside branch show up in `.list`?
+ *
+ * Branches are otherwise hidden, but one that is still running - or was
+ * interrupted and left behind - holds a number, so hiding it would leave an
+ * unexplained gap and no way to name it for `.stop`.
+ */
+export function asideVisibleInList(
+  session: { time?: { updated?: number } },
+  now: number,
+  busy: boolean,
+  windowMs = ASIDE_LIST_MS,
+): boolean {
+  return busy || now - (session.time?.updated ?? 0) <= windowMs;
+}
+
 /** Reply to `.list`: the sessions you can address, most recent first. */
 async function sendList(): Promise<void> {
+  const now = Date.now();
   const rows = (await allSessions())
-    .filter((s) => !s.parentID && !isAsideSession(s))
+    .filter((s) => !s.parentID)
+    .filter((s) => !isAsideSession(s) || asideVisibleInList(s, now, busySessions.has(s.id)))
     .sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
     .slice(0, LIST_LINES)
-    .map(
-      (s): ListRow => ({
-        // Listing is how you address them, so hand out numbers here: whatever
-        // the list shows can be named in the next command.
+    .map((s): ListRow => {
+      // Listing is how you address them, so hand out numbers here: whatever the
+      // list shows can be named in the next command.
+      const state = busySessions.has(s.id)
+        ? "运行中"
+        : `空闲（${fmtAgo(s.time?.updated ? now - s.time.updated : null)}）`;
+      return {
         num: sessionNumbers.numberFor(s.id),
         directory: s.directory ?? "?",
-        state: busySessions.has(s.id)
-          ? "运行中"
-          : `空闲（${fmtAgo(s.time?.updated ? Date.now() - s.time.updated : null)}）`,
+        state: isAsideSession(s) ? `旁问分支 · ${state}` : state,
         title: s.title,
-      }),
-    );
+      };
+    });
   await sendText(formatList(rows, LIST_LINES));
   log(`command: list (${rows.length} shown)`);
 }

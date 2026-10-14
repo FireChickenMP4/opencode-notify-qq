@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { asideFraming, asideRules, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
+import { asideFraming, asideRules, asideVisibleInList, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -386,6 +386,22 @@ describe("asideRules", () => {
 
   test("full adds no rules of its own", () => {
     expect(asideRules("full", sandbox)).toHaveLength(0);
+  });
+});
+
+describe("asideVisibleInList", () => {
+  const now = 1_000_000_000;
+  test("a running branch is always visible", () => {
+    expect(asideVisibleInList({ time: { updated: now - 86_400_000 } }, now, true)).toBe(true);
+  });
+
+  test("a recent branch is visible, an old one is not", () => {
+    expect(asideVisibleInList({ time: { updated: now - 60_000 } }, now, false)).toBe(true);
+    expect(asideVisibleInList({ time: { updated: now - 20 * 60_000 } }, now, false)).toBe(false);
+  });
+
+  test("an unknown timestamp is treated as old", () => {
+    expect(asideVisibleInList({}, now, false)).toBe(false);
   });
 });
 
