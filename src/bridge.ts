@@ -842,6 +842,7 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
       } catch (cause) {
         const why = cause instanceof Error ? cause.message : String(cause);
         log(`aside agent switch to ${config.asideAgent} failed: ${why}`);
+        await sendText(`旁问问不到 ${config.asideAgent} agent（${why}），这轮沿用会话自己的 agent，工具可能不全`);
       }
     }
 
@@ -1076,9 +1077,17 @@ export function formatPermission(
   metadata: Record<string, unknown>,
   patterns: string[],
   sessionNum?: number,
+  aside = false,
 ): string {
-  const header = sessionNum !== undefined ? `**需要授权 · #${sessionNum}**` : `**需要授权**`;
+  // A request out of nowhere is baffling, and an aside fork asking for approval
+  // is exactly that: label it, and say where the fork lives.
+  const header = aside
+    ? "**需要授权 · 来自旁问**"
+    : sessionNum !== undefined
+      ? `**需要授权 · #${sessionNum}**`
+      : "**需要授权**";
   const lines = [header, `目录: \`${directory}\``, `工具: **${permission}**`];
+  if (aside) lines.push("（这是 `.bt` 旁问在问你：它跑在一个用完即弃的分支里，答完就删）");
 
   if (permission === "external_directory") {
     const dirs = Array.isArray(metadata.directories) ? metadata.directories.map(String) : [];
@@ -1266,9 +1275,10 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
       /* keep "(unknown)" */
     }
     const num = anySessionID ? rememberSession(anySessionID) : undefined;
+    const aside = anySessionID ? asideIds.has(anySessionID) || asideSeen.has(anySessionID) : false;
 
     pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
-    await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num));
+    await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
     log(`permission ${requestID} (${permission}) -> QQ`);
   } catch (cause) {
     log(`failed to handle permission: ${cause instanceof Error ? cause.message : cause}`);

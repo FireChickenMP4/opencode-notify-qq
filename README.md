@@ -57,7 +57,7 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
 | `notifyTarget.type` | `c2c`（单聊）或 `group`（群聊） |
 | `notifyTarget.openid` | `c2c` 用；`group` 时改用 `groupOpenid` |
 | `awayNotify.enabled` | 回合结束时**自动**推 QQ。**默认 false** |
-| `asideTools` | `.bt` 旁问的权限档位：`"guarded"`（**默认**：改工作区文件、执行命令都弹审批 → 推到 QQ；沙盒目录里的改动不用审批）/ `"readonly"`（只读，不能写、不能跑）/ `"full"`（和普通回合一样）。每次调用时读 |
+| `asideTools` | `.bt` 旁问的权限档位：`"guarded"`（**默认**：改工作区文件、执行命令都弹审批 → 推到 QQ；沙盒目录里的写按规则免审批，未命中时退成审批）/ `"readonly"`（只读，不能写、不能跑）/ `"full"`（和普通回合一样）。每次调用时读 |
 | `asideAgent` | `.bt` 旁问用哪个 agent。**默认 `"build"`**（opencode 自带的编码 agent，工具集完整）；`"inherit"` 沿用会话自己的 agent —— 注意 agent 的工具集是硬上限：如果它会话的 agent 没有 read/shell，旁问就只能凭已知信息回答 |
 | `asidePrompt` | 追加到 `.btw` / `.bt` 提示词末尾的自定义要求（例如「回答用中文，先给结论」）。**默认空**，每次调用时读 |
 

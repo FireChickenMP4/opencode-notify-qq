@@ -63,4 +63,11 @@ describe("formatPermission", () => {
     const out = formatPermission("D:/Desktop", "bash", { command: "x" }, []);
     expect(out).not.toContain("#");
   });
+
+  test("an aside fork's request says so, and carries no number", () => {
+    const out = formatPermission("D:/Desktop", "shell", { command: "ls" }, [], undefined, true);
+    expect(out).toContain("来自旁问");
+    expect(out).toContain("用完即弃");
+    expect(out).not.toContain("#");
+  });
 });
