@@ -923,6 +923,7 @@ async function runAsideCore(
   target: string,
   question: string,
   onReady?: (info: { forkNum?: number; agent: string; agentError?: string }) => Promise<void> | void,
+  keep = false,
 ): Promise<AsideRun> {
   let forkID: string | undefined;
   let forkNum: number | undefined;
@@ -978,7 +979,9 @@ async function runAsideCore(
   } finally {
     if (forkID) {
       asideIds.delete(forkID);
-      await client().session.remove({ sessionID: forkID }).catch(() => {});
+      // A kept branch is the TUI's answer view: the session stays (and keeps being
+      // recognised as an aside by its title/metadata), only its sandbox goes.
+      if (!keep) await client().session.remove({ sessionID: forkID }).catch(() => {});
       try {
         rmSync(asideSandbox(forkID), { recursive: true, force: true });
       } catch {
@@ -998,42 +1001,77 @@ function asideBody(run: AsideRun, max = 3500): string {
  * `.bt` from QQ: acknowledge with the branch and its agent, run, push the answer.
  *
  * Detached by the caller: a tool-using turn takes minutes, and `.stop` plus
- * approvals must not queue behind it.
+ * approvals must not queue behind it. `options.push` is false for a TUI aside when
+ * away notifications are off, and `options.keep` keeps the branch as a readable
+ * session (see runAsideTui).
  */
-async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<AsideRun> {
-  const run = await runAsideCore(target, question, async ({ forkNum, agent, agentError }) => {
-    const who = agentError
-      ? `agent 换不上（${agentError}），沿用会话自己的`
-      : agent === "inherit"
-        ? "agent 沿用会话自己的"
-        : `agent ${agent}`;
-    await sendText(`旁问(工具)已发出：分支 #${forkNum} · ${who} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
-  });
+async function runAside(
+  target: string,
+  num: number | undefined,
+  tag: string,
+  question: string,
+  options: { push?: boolean; keep?: boolean } = {},
+): Promise<AsideRun> {
+  const push = options.push !== false;
+  const run = await runAsideCore(
+    target,
+    question,
+    async ({ forkNum, agent, agentError }) => {
+      if (!push) return;
+      const who = agentError
+        ? `agent 换不上（${agentError}），沿用会话自己的`
+        : agent === "inherit"
+          ? "agent 沿用会话自己的"
+          : `agent ${agent}`;
+      await sendText(`旁问(工具)已发出：分支 #${forkNum} · ${who} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
+    },
+    options.keep === true,
+  );
   if (run.error) {
-    await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
+    if (push) await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
     return run;
   }
-  const asked = num !== undefined ? `问 #${num}` : "问当前会话";
-  await sendWithRetry(
-    `**opencode · 旁问(工具) · ${asked}**\n\n\`分支 #${run.forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${asideBody(run)}`,
+  if (push) {
+    const asked = num !== undefined ? `问 #${num}` : "问当前会话";
+    await sendWithRetry(
+      `**opencode · 旁问(工具) · ${asked}**\n\n\`分支 #${run.forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${asideBody(run)}`,
+    );
+  }
+  log(
+    `bt answered for ${target} via ${run.forkID} (${run.finished ? "done" : "timeout"}${push ? "" : ", quiet"}): ${preview(question)}`,
   );
-  log(`bt answered for ${target} via ${run.forkID} (${run.finished ? "done" : "timeout"}): ${preview(question)}`);
   return run;
 }
 
+/** The last branch a TUI `/bt` kept for reading; the next one replaces it. */
+let lastKeptAside: string | undefined;
+
 /**
- * `/bt` from the TUI: the same run, tagged with the session it was asked from.
+ * `/bt` from the TUI: run it, keep the branch, and let the CLI plugin navigate to
+ * it - a real session view renders markdown and scrolls, which a plugin dialog
+ * cannot. QQ is pushed only when away notifications are on, since the TUI shows the
+ * answer anyway (approvals are pushed regardless: they need an answer).
  *
  * The answer is NOT injected as a `synthetic` message: the TUI does not render
  * one, while the model receives it as if the user had typed it (verified - an
- * aside answer came back as user input and started a turn). The CLI plugin
- * renders the answer, and the QQ push is the other delivery.
+ * aside answer came back as user input and started a turn).
  */
 async function runAsideTui(sessionID: string, question: string): Promise<AsideRun> {
   const directory = await sessionDirectory(sessionID).catch(() => "?");
   const num = sessionNumbers.lookup(sessionID);
   const tag = `[${num !== undefined ? `#${num} ` : ""}${directory}]`;
-  return runAside(sessionID, num, tag, question);
+  const run = await runAside(sessionID, num, tag, question, {
+    push: loadConfig().awayNotify,
+    keep: true,
+  });
+  // Keep at most one branch around: the previous answer is done being read.
+  if (run.forkID) {
+    if (lastKeptAside && lastKeptAside !== run.forkID) {
+      await client().session.remove({ sessionID: lastKeptAside }).catch(() => {});
+    }
+    lastKeptAside = run.forkID;
+  }
+  return run;
 }
 
 async function runCommand(cmd: Command): Promise<void> {
@@ -1660,6 +1698,7 @@ async function run(): Promise<number> {
             error: run.error,
             finished: run.finished,
             branch: run.forkNum,
+            forkID: run.forkID,
           });
         }
         return new Response("opencode-notify-qq bridge\n");

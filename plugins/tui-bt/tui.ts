@@ -21,7 +21,9 @@ export default Plugin.define({
       return route?.type === "session" && route.sessionID ? route.sessionID : undefined;
     }
 
-    async function ask(question: string): Promise<{ answer?: string; error?: string }> {
+    async function ask(
+      question: string,
+    ): Promise<{ answer?: string; error?: string; forkID?: string; branch?: number }> {
       try {
         const res = await fetch(`${BRIDGE}/aside?wait=1`, {
           method: "POST",
@@ -29,10 +31,16 @@ export default Plugin.define({
           body: JSON.stringify({ sessionID: currentSession(), question }),
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
-        const data = (await res.json()) as { answer?: string; error?: string; ok?: boolean };
+        const data = (await res.json()) as {
+          answer?: string;
+          error?: string;
+          ok?: boolean;
+          forkID?: string;
+          branch?: number;
+        };
         if (data.error) return { error: data.error };
         if (!data.ok && !data.answer) return { error: `bridge 返回 ${res.status}` };
-        return { answer: data.answer };
+        return { answer: data.answer, forkID: data.forkID, branch: data.branch };
       } catch (cause) {
         const why = cause instanceof Error ? cause.message : String(cause);
         return { error: `${why}（bridge 没在 127.0.0.1:${BRIDGE.split(":").pop()} 上？）` };
@@ -58,10 +66,20 @@ export default Plugin.define({
               });
               return;
             }
-            const { answer, error } = await ask(question);
-            await context.ui.dialog.alert({
-              title: error ? "旁问失败" : answer ? "旁问答案" : "旁问（没有内容）",
-              message: error ?? answer ?? "（这一轮没有产出文本，可能是超时或分支被收掉了）",
+            const { answer, error, forkID, branch } = await ask(question);
+            if (error || !forkID) {
+              await context.ui.dialog.alert({ title: "旁问失败", message: error ?? "bridge 没有返回分支" });
+              return;
+            }
+            // The branch itself is the answer view: navigating there gives a real
+            // session transcript, so markdown renders and long answers scroll. The
+            // toast stays behind as a way back to it.
+            context.ui.router.navigate({ type: "session", sessionID: forkID });
+            context.ui.toast.show({
+              title: branch !== undefined ? `旁问答案 · 分支 #${branch}` : "旁问答案",
+              message: answer ? answer.slice(0, 140) : "（这一轮没有产出文本）",
+              variant: answer ? "success" : "warning",
+              sessionID: forkID,
             });
           },
         },
