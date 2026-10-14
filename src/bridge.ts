@@ -732,7 +732,12 @@ function asideSandbox(forkID: string): string {
  * phone, come from a throwaway context, and are not a work order. The user's own
  * words (`asidePrompt` in the config file) go last, so they win.
  */
-export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePrompt, sandbox?: string): string {
+export function asideFraming(
+  kind: "btw" | "bt",
+  extra = loadConfig().asidePrompt,
+  sandbox?: string,
+  mode: "readonly" | "guarded" | "full" = loadConfig().asideTools,
+): string {
   const shared = [
     "【QQ 旁问】用户不在电脑前，你这段回答会作为一条 QQ 消息直接推到他手机上。请照这个来写：",
     "1. 先给结论，再给必要的依据；手机屏幕小，能短就短，不要贴大段代码或长表格；",
@@ -740,18 +745,20 @@ export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePromp
     "3. 用户问的多半是「这是什么 / 为什么 / 怎么办」—— 直接回答即可：不要为了回答去改文件、跑命令或做实验（需要动手的，他会用 .ask / .task）；",
     "4. 用中文，把话说清楚，别堆术语。",
   ].join("\n");
+  // The wording has to follow the permission mode: promising approvals under
+  // "full" (where nothing asks) would be plainly wrong.
+  const abilities: Record<"readonly" | "guarded" | "full", string> = {
+    readonly:
+      "你在一份用完即弃的只读分支里（主会话不受影响）：可以读文件、搜索、查资料，但改不了文件、也跑不了命令",
+    guarded: `你在一份用完即弃的临时分支里（主会话不受影响）：可以读文件、搜索、查资料；改工作区文件或执行命令都会弹审批推到用户手机上${
+      sandbox ? `，而写进沙盒目录 ${sandbox} 不用审批` : ""
+    }`,
+    full: "你在一份用完即弃的临时分支里（主会话不受影响）：读文件、搜索、改文件、执行命令都可以 —— 这一档不会弹审批，所以更要克制，只做回答这件事所需的最小动作",
+  };
   const tools =
     kind === "btw"
       ? "另外：你没有工具可用 —— 如果回答需要读文件、查网页或跑命令，就用一句话说明「这要看代码/跑一下，请用 .ask 问我」，不要猜、不要编。"
-      : [
-          "另外：你在一份用完即弃的临时分支里（主会话不受影响），可以读文件、搜索、查资料。",
-          sandbox
-            ? `想做实验就写进沙盒目录 ${sandbox}（那里的改动不用审批）；改工作区里的文件、或执行命令，都会弹审批推到用户手机上，所以能不动就不动，必须动就用一句话说明理由。`
-            : "",
-          "如果回答必须动手改或跑才能给出，就用一句话请他改用 .ask 问我。",
-        ]
-          .filter(Boolean)
-          .join("\n");
+      : [`另外：${abilities[mode]}。`, "如果回答必须动手改或跑才能给出，就用一句话请他改用 .ask 问我。"].join("\n");
   return [shared, tools, ...(extra ? [extra] : [])].join("\n");
 }
 
@@ -876,7 +883,7 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     const baseline = (await sessionMessages(forkID)).length;
     await client().session.prompt({
       sessionID: forkID,
-      text: `${asideFraming("bt", config.asidePrompt, sandbox)}\n\n${question}`,
+      text: `${asideFraming("bt", config.asidePrompt, sandbox, config.asideTools)}\n\n${question}`,
     });
     const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
     const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();

@@ -61,13 +61,12 @@ describe("formatPermission", () => {
 
   test("omits the number when unknown", () => {
     const out = formatPermission("D:/Desktop", "bash", { command: "x" }, []);
-    expect(out).not.toContain("#");
+    expect(out.split("\n")[0]).toBe("**需要授权**");
   });
 
   test("an aside fork's request says so, and carries no number", () => {
     const out = formatPermission("D:/Desktop", "shell", { command: "ls" }, [], undefined, true);
-    expect(out).toContain("来自旁问");
+    expect(out.split("\n")[0]).toBe("**需要授权 · 来自旁问**");
     expect(out).toContain("用完即弃");
-    expect(out).not.toContain("#");
   });
 });
