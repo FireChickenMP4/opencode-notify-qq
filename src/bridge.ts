@@ -763,26 +763,23 @@ export function asideFraming(
   mode: "readonly" | "guarded" | "full" = loadConfig().asideTools,
 ): string {
   const shared = [
-    "【QQ 旁问】用户不在电脑前，你这段回答会作为一条 QQ 消息直接推到他手机上。请照这个来写：",
-    "1. 先给结论，再给必要的依据；手机屏幕小，能短就短，不要贴大段代码或长表格；",
-    "2. 不要复述问题、不要汇报过程、不要给「下一步计划」，也不要反问「要不要我继续」；",
-    "3. 用户问的多半是「这是什么 / 为什么 / 怎么办」—— 直接回答即可：不要为了回答去改文件、跑命令或做实验（需要动手的，他会用 .ask / .task）；",
-    "4. 用中文，把话说清楚，别堆术语。",
+    "【QQ 旁问】用户不在电脑前，这段回答会作为一条 QQ 消息推到他手机上。",
+    "先给结论、能短就短（手机屏小，别贴大段代码或长表格）；不要复述问题、不要汇报过程、不要给「下一步计划」或反问要不要继续；也不要为了回答去改文件、跑命令或做实验 —— 需要动手时他会用 .ask / .task。用中文，别堆术语。",
   ].join("\n");
   // The wording has to follow the permission mode: promising approvals under
   // "full" (where nothing asks) would be plainly wrong.
   const abilities: Record<"readonly" | "guarded" | "full", string> = {
     readonly:
-      "你在一份用完即弃的只读分支里（主会话不受影响）：可以读文件、搜索、查资料，但改不了文件、也跑不了命令",
-    guarded: `你在一份用完即弃的临时分支里（主会话不受影响）：可以读文件、搜索、查资料；改工作区文件或执行命令都会弹审批推到用户手机上${
+      "另外：你在一份用完即弃的只读分支里（主会话不受影响）：可以读文件、搜索、查资料，但改不了文件、也跑不了命令。",
+    guarded: `另外：你在一份用完即弃的临时分支里（主会话不受影响）：可以读文件、搜索、查资料；改工作区文件或执行命令会弹审批给用户${
       sandbox ? `，而写进沙盒目录 ${sandbox} 不用审批` : ""
-    }`,
-    full: "你在一份用完即弃的临时分支里（主会话不受影响）：读文件、搜索、改文件、执行命令都可以 —— 这一档不会弹审批，所以更要克制，只做回答这件事所需的最小动作",
+    }。`,
+    full: "另外：你在一份用完即弃的临时分支里（主会话不受影响）：读文件、搜索、改文件、执行命令都可以 —— 这一档不会弹审批，所以更要克制，只做回答这件事所需的最小动作。",
   };
   const tools =
     kind === "btw"
       ? "另外：你没有工具可用 —— 如果回答需要读文件、查网页或跑命令，就用一句话说明「这要看代码/跑一下，请用 .ask 问我」，不要猜、不要编。"
-      : [`另外：${abilities[mode]}。`, "如果回答必须动手改或跑才能给出，就用一句话请他改用 .ask 问我。"].join("\n");
+      : `${abilities[mode]}\n如果回答必须动手改或跑才能给出，就用一句话请他改用 .ask 问我。`;
   return [shared, tools, ...(extra ? [extra] : [])].join("\n");
 }
 
@@ -1017,7 +1014,8 @@ async function runAside(
     target,
     question,
     async ({ forkID, forkNum, agent, agentError }) => {
-      asidePush.set(forkID, push);
+      // Approvals from any aside go to QQ, however the aside was started.
+      asidePush.set(forkID, true);
       if (!push) return;
       const who = agentError
         ? `agent 换不上（${agentError}），沿用会话自己的`
@@ -1049,12 +1047,13 @@ async function runAside(
 let lastKeptAside: string | undefined;
 
 /**
- * Whether each running aside wants its approvals pushed. A QQ `.bt` does (it was
- * asked from the phone, so waiting for an approval nobody sees would hang it); a
- * TUI `/bt` does not (the TUI asks on screen). Keyed by fork id, dropped when the
- * aside ends.
+ * Asides whose approvals must be pushed.
+ *
+ * Every aside goes in here: an aside is a background fork, and the TUI only prompts
+ * for the session the user is looking at, so a suppressed approval means the aside
+ * waits for nobody until its hard cap. Dropped when the aside ends.
  */
-const asidePush = new Map<string, boolean>();
+const asidePush = new Map<string, true>();
 
 /**
  * `/bt` from the TUI: run it, keep the branch, and let the CLI plugin navigate to
@@ -1496,9 +1495,9 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
     // Tracked above either way (the aside wait and the QQ reply both use it). The
-    // push follows the away switch - except for an aside that was itself asked from
-    // QQ: waiting for an approval nobody sees would hang it.
-    const asideWantsPush = anySessionID ? asidePush.get(anySessionID) === true : false;
+    // push follows the away switch, except for asides: a background fork cannot be
+    // approved anywhere else, so its requests always go out.
+    const asideWantsPush = anySessionID ? asidePush.has(anySessionID) : false;
     if (loadConfig().awayNotify || asideWantsPush) {
       await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
       log(`permission ${requestID} (${permission}) -> QQ${asideWantsPush ? " (aside)" : ""}`);

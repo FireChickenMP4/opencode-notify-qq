@@ -342,7 +342,7 @@ describe("asideFraming", () => {
 
   test("each kind states its own capability boundary", () => {
     expect(asideFraming("btw", "")).toContain("没有工具可用");
-    expect(asideFraming("bt", "")).toContain("用完即弃");
+    expect(asideFraming("bt", "")).toContain("用完即弃的临时分支");
   });
 
   test("the bt wording follows the mode: only guarded promises approvals", () => {
