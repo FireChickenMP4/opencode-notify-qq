@@ -41,7 +41,7 @@ export default Plugin.define({
 
         answered.add(requestID);
         const detail = (data.resources ?? []).join(" ").trim();
-        const choice = await context.ui.dialog.select<"once" | "always" | "reject">({
+        const ask = context.ui.dialog.select<"once" | "always" | "reject">({
           title: `旁问需要授权 · ${data.action ?? "工具"}`,
           placeholder: detail.slice(0, 120),
           options: [
@@ -50,6 +50,23 @@ export default Plugin.define({
             { title: "拒绝", value: "reject" },
           ],
         });
+
+        // Both channels can be live at once (QQ is pushed while awayNotify is on).
+        // Whoever answers first wins: retire this dialog as soon as the request is
+        // gone, so it never asks about something already decided.
+        void (async () => {
+          for (let i = 0; i < 300; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            await context.data.session.permission.sync(sessionID).catch(() => {});
+            const live = context.data.session.permission.list(sessionID) ?? [];
+            if (!live.some((p) => p.id === requestID)) {
+              context.ui.dialog.clear();
+              return;
+            }
+          }
+        })();
+
+        const choice = await ask;
         if (!choice) return;
         try {
           await context.client.permission.reply({ sessionID, requestID, decision: choice });
