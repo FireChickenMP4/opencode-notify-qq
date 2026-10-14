@@ -335,6 +335,12 @@ describe("isAsideSession", () => {
 });
 
 describe("asideFraming", () => {
+  test("the opening follows the channel", () => {
+    expect(asideFraming("bt", "", undefined, "guarded", "tui")).toContain("就坐在电脑前");
+    expect(asideFraming("bt", "", undefined, "guarded", "qq")).toContain("不在电脑前");
+    expect(asideFraming("bt", "")).toContain("不在电脑前");
+  });
+
   test("both kinds say it is a phone-bound aside", () => {
     expect(asideFraming("btw", "")).toContain("QQ 旁问");
     expect(asideFraming("bt", "")).toContain("QQ 旁问");
