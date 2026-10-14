@@ -143,7 +143,7 @@ export default Plugin.define({
               });
               return;
             }
-            const { answer, error, forkID, branch } = await ask(question, (sent) => {
+            const { answer, error, forkID } = await ask(question, (sent) => {
               // The run takes tens of seconds: without this the command looks like
               // it did nothing at all.
               context.ui.toast.show({
@@ -157,16 +157,16 @@ export default Plugin.define({
               await context.ui.dialog.alert({ title: "旁问失败", message: error ?? "bridge 没有返回分支" });
               return;
             }
-            // The branch itself is the answer view: navigating there gives a real
-            // session transcript, so markdown renders and long answers scroll. The
-            // toast stays behind as a way back to it.
+            // Navigating to the branch IS the delivery: it is a real session view, so
+            // markdown renders and long answers scroll. No completion toast - by the
+            // time it could appear, the user is already reading the answer.
             context.ui.router.navigate({ type: "session", sessionID: forkID });
-            context.ui.toast.show({
-              title: branch !== undefined ? `旁问答案 · 分支 #${branch}` : "旁问答案",
-              message: answer ? answer.slice(0, 140) : "（这一轮没有产出文本）",
-              variant: answer ? "success" : "warning",
-              sessionID: forkID,
-            });
+            if (!answer) {
+              await context.ui.dialog.alert({
+                title: "旁问",
+                message: "（这一轮没有产出文本，可能是超时，或分支被收掉了）",
+              });
+            }
           },
         },
       ],
