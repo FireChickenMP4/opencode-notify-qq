@@ -4,7 +4,8 @@
 #   notify-qq on           -> enable (ping me when a turn finishes or a permission waits)
 #   notify-qq off          -> disable
 #   notify-qq toggle       -> flip
-#   notify-qq bridge-stop  -> kill the bridge so the plugin starts a fresh one
+#   notify-qq bridge-stop  -> kill the bridge (the plugin starts one again at its next load)
+#   notify-qq bridge-restart -> kill it and immediately start the current build
 #
 # Works while opencode is running: the plugin re-reads the config on every
 # event, so the change takes effect immediately. Nothing here talks to opencode.
@@ -27,14 +28,40 @@ function Stop-PortHolder([int]$Port) {
     return [bool]$conns
 }
 
-# The plugin already replaces a bridge whose source changed; this is the manual
-# escape hatch for a wedged daemon (the plugin respawns one on its next setup).
+# The plugin already replaces a bridge whose source changed, but only when it
+# loads. These are the manual escape hatches: `bridge-stop` kills a wedged
+# daemon, `bridge-restart` kills it and immediately starts the current build.
 if ($Action.ToLower() -eq "bridge-stop") {
     if (Stop-PortHolder $bridgePort) {
-        Write-Output "stopped the bridge on port $bridgePort; the plugin will start a fresh one"
+        Write-Output "stopped the bridge on port $bridgePort (the plugin restarts it at its next load)"
         exit 0
     }
     Write-Output "nothing listening on $bridgePort"
+    exit 0
+}
+
+if ($Action.ToLower() -eq "bridge-restart") {
+    # The bridge lives next to this CLI; its state and log live one level up,
+    # where the plugin computes HERE (the plugin file's directory).
+    $script = Join-Path $PSScriptRoot "bridge.ts"
+    if (-not (Test-Path $script)) { Write-Output "bridge.ts not found at $script"; exit 1 }
+    $bun = (Get-Command bun -ErrorAction SilentlyContinue).Source
+    if (-not $bun) { Write-Output "bun not found on PATH; start the bridge manually"; exit 1 }
+
+    $pluginsDir = Split-Path $PSScriptRoot -Parent
+    if (Stop-PortHolder $bridgePort) { Write-Output "stopped the old bridge on port $bridgePort" }
+    Start-Sleep -Milliseconds 500
+
+    # Same environment the plugin passes, so the hash check and the state file
+    # keep working (a stale hash would make the plugin replace it again).
+    $env:OPENCODE_NOTIFY_QQ_BRIDGE_STATE = Join-Path $pluginsDir "bridge.state.json"
+    $env:OPENCODE_NOTIFY_QQ_BRIDGE_HASH = (Get-FileHash $script -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
+    $log = Join-Path $pluginsDir "bridge.log"
+    Start-Process -FilePath $bun -ArgumentList @("run", $script) `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -WindowStyle Hidden | Out-Null
+
+    Start-Sleep -Seconds 4
+    Write-Output "bridge restarted from $script (lock port $bridgePort, log $log)"
     exit 0
 }
 
@@ -85,7 +112,7 @@ switch ($Action.ToLower()) {
         Write-Output ("away auto-push: " + $(if ($next) { "ON" } else { "OFF" }))
     }
     default {
-        Write-Output "usage: notify-qq [on|off|status|toggle|bridge-stop]"
+        Write-Output "usage: notify-qq [on|off|status|toggle|bridge-stop|bridge-restart]"
         exit 2
     }
 }

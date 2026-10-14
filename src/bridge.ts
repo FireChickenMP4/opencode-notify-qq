@@ -621,13 +621,27 @@ async function runCommand(cmd: Command): Promise<void> {
       return;
     }
 
-    // .btw asks a side question: it is answered from the session's context and
-    // is not added to the conversation, so it disturbs neither the running turn
-    // nor the transcript. It does cost one model call.
+    // .btw asks a side question: it is answered from the session's context and is
+    // not added to the conversation, so it disturbs neither the running turn nor
+    // the transcript. A model call takes seconds, so acknowledge first - `.task`
+    // answers immediately and the silence here would look like a failure.
     if (cmd.kind === "btw") {
-      const answer = (await client().session.generate({ sessionID: target, prompt: cmd.text })).text.trim();
-      const body = answer.length > 3500 ? `${answer.slice(0, 3500)}...` : answer;
-      await sendWithRetry(`**opencode · 旁问**\n\n\`${tag}\` ${cmd.text.slice(0, 80)}\n\n---\n\n${body}`);
+      await sendText(`旁问已发出 ${tag}，稍后回你：${cmd.text.slice(0, 80)}`);
+
+      // Generation mode cannot call tools: a reply that tries to (read a file,
+      // look something up) comes back empty or stops mid-sentence. Say so, and
+      // say "don't guess" too - silence alone would invite making something up.
+      const prompt =
+        "只依据你已知的信息与会话上下文直接回答。你无法使用任何工具：如果回答需要读文件、查网页" +
+        "或运行命令，就直接说你做不到，不要猜也不要编：\n\n" + cmd.text;
+      const answer = (await client().session.generate({ sessionID: target, prompt })).text.trim();
+      const body = answer
+        ? answer.length > 3500
+          ? `${answer.slice(0, 3500)}...`
+          : answer
+        : "(没有内容 —— 这个问题大概需要读文件/查网页，旁问用不了工具，改用 .ask 吧)";
+      const heading = num !== undefined ? `**opencode · 旁问 · #${num}**` : `**opencode · 旁问**`;
+      await sendWithRetry(`${heading}\n\n\`${tag}\` ${cmd.text.slice(0, 80)}\n\n---\n\n${body}`);
       log(`btw answered for ${target}: ${preview(cmd.text)}`);
       return;
     }

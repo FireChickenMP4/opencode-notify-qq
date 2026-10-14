@@ -255,3 +255,16 @@ question 工具在 V2 表现为 orm.created。它和审批一样需要你回应
 选项文字会映射成选项的 value，其他按自由文本发）。没有待回答的表单时该命令无效。
 bridge 用 orm.created / orm.replied / orm.cancelled 维护待回答表，
 并在命令前用 session.form.list({sessionID}) 剔除已失效的。
+
+
+### .btw 的两个修正（实测反馈）
+
+- **截断**：`session.generate` 不能用工具，模型想动手（查文件/网页）时文本会停在那儿。现在给旁问的
+  prompt 加一句「不要使用任何工具、也不要提议去查阅」，并给答案的标题加上会话编号
+  （`**opencode · 旁问 · #N**`）。
+- **没有反馈**：一次模型调用要几秒，之前是干等；现在先回一条「旁问已发出 …，稍后回你」再回答案。
+
+顺带记下官方口径（CLI 插件文档）：斜杠命令与快捷键由 **CLI 插件**（`@opencode/plugin/tui` 的
+`context.keymap.layer({ commands: [{ bind, slash, palette, run }] })`）注册；服务端插件只能用
+`ctx.command.transform` 注册命令（没有 bind）。命令是否打断回合由投递方式决定
+（`session.prompt({ delivery: "steer" | "queue" })`），所以「不打断」两种入口都能做到。
