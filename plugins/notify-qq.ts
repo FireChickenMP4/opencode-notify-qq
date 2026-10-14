@@ -465,7 +465,7 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
         })
       : null;
 
-  type SessionInfo = { parentID?: string; title?: string; directory?: string };
+  type SessionInfo = { parentID?: string; title?: string; directory?: string; aside?: boolean };
   const sessionCache = new Map<string, SessionInfo>();
 
   /** Resolve whether a session is a subagent, and its title. */
@@ -475,7 +475,16 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
     try {
       // V2 returns the session record directly, not a `{ data }` envelope.
       const data = await ctx.session.get({ sessionID });
-      const info: SessionInfo = { parentID: data.parentID, title: data.title, directory: data.location?.directory };
+      const info: SessionInfo = {
+        parentID: data.parentID,
+        title: data.title,
+        directory: data.location?.directory,
+        // A `.bt` aside is a fork with no parentID, so it is recognised by the
+        // marker the bridge puts on it (the title is the fallback).
+        aside:
+          (data as { metadata?: { aside?: boolean } }).metadata?.aside === true ||
+          Boolean(data.title?.startsWith("旁问 ·")),
+      };
       sessionCache.set(sessionID, info);
       return info;
     } catch {
@@ -634,6 +643,12 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
     // Subagents finish while the main session keeps working; reporting them
     // as "done" is misleading and noisy. Off unless explicitly enabled.
     const info = sessionID ? await sessionInfo(sessionID) : {};
+    // An aside fork answers a `.bt` the bridge is about to relay itself; a push
+    // here would announce it as a finished session.
+    if (info.aside) {
+      trace(`turn end skipped: aside fork (${shortTitle(info.title)})`);
+      return;
+    }
     if (info.parentID) {
       if (process.env.OPENCODE_NOTIFY_SUBAGENT !== "1") {
         trace(`turn end skipped: subagent (${shortTitle(info.title)})`);

@@ -310,6 +310,9 @@ const draining = new Set<string>();
  * lastSessionID so untargeted commands hit the session that is actually active.
  */
 function rememberSession(sessionID: string): number | undefined {
+  // Our own aside fork: keep it out of the numbering and hand every untagged
+  // command back to the session the user actually means.
+  if (asideIds.has(sessionID)) return undefined;
   lastSessionID = sessionID;
   if (subagentIds.has(sessionID)) return undefined;
   return sessionNumbers.numberFor(sessionID);
@@ -317,6 +320,14 @@ function rememberSession(sessionID: string): number | undefined {
 
 /** Sessions known to be subagents (have a parentID). */
 const subagentIds = new Set<string>();
+
+/**
+ * Forks this process created for `.bt`. Unlike a subagent, a fork carries no
+ * parentID, so without this it would take a session number and become the
+ * default target: an untagged command would then hit the side question while
+ * the real session sits right there.
+ */
+const asideIds = new Set<string>();
 let registryAt = 0;
 
 /**
@@ -563,18 +574,23 @@ export function lastAssistantText(msgs: Msg[], from: number): string {
 }
 
 /**
- * Wait for the forked session to finish a turn: its last message is an assistant
- * message that is not a tool round. Polling the transcript keeps this off the
- * event bookkeeping, which only tracks sessions we are told about.
+ * Wait for the forked session to finish a turn.
+ *
+ * A turn ends with an `idle` message (`outcome: succeeded|failed`); the answer
+ * itself is the assistant message just before it. Checking for a terminal
+ * `finish` as well covers the moment before that marker is written. Polling the
+ * transcript keeps this off the event bookkeeping, which only tracks sessions we
+ * are told about.
  */
 async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(700);
     const msgs = await sessionMessages(sessionID).catch(() => [] as Msg[]);
-    if (msgs.length <= baseline) continue;
-    const last = msgs[msgs.length - 1];
-    if (last?.type === "assistant" && last.finish && last.finish !== "tool-calls" && last.time?.completed) {
+    const tail = msgs.slice(baseline);
+    if (!tail.some((m) => m.type === "assistant")) continue;
+    if (tail.some((m) => m.type === "idle")) return true;
+    if (tail.some((m) => m.type === "assistant" && m.finish && m.finish !== "tool-calls" && m.time?.completed)) {
       return true;
     }
   }
@@ -682,8 +698,17 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     forkID = fork?.id;
     if (!forkID) throw new Error("fork 没有返回会话 id");
 
+    // Register before anything else can report it: to us a fork must never look
+    // like a session of its own, and the metadata is what the plugin reads to
+    // stay quiet about it.
+    asideIds.add(forkID);
     const rules = asidePermissions();
-    if (rules.length) await client().session.update({ sessionID: forkID, permissions: rules });
+    await client().session.update({
+      sessionID: forkID,
+      title: `旁问 · ${question.slice(0, 40)}`,
+      metadata: { aside: true },
+      ...(rules.length ? { permissions: rules } : {}),
+    });
 
     const baseline = (await sessionMessages(forkID)).length;
     await client().session.prompt({ sessionID: forkID, text: question });
@@ -696,7 +721,10 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
       : finished
         ? "(没有内容)"
         : "(超时 —— 这一轮还没答完，先用 .status 看看)";
-    const heading = num !== undefined ? `**opencode · 旁问(工具) · #${num}**` : "**opencode · 旁问(工具)**";
+    // Name the session the question was asked about: the fork is throwaway, so
+    // the target's number is the thing a reply can address.
+    const asideNum = num ?? sessionNumbers.numberFor(target);
+    const heading = `**opencode · 旁问(工具) · #${asideNum}**`;
     await sendWithRetry(`${heading}\n\n\`${tag}\` ${question.slice(0, 80)}\n\n---\n\n${body}`);
     log(`bt answered for ${target} via ${forkID} (${finished ? "done" : "timeout"}): ${preview(question)}`);
   } catch (cause) {
@@ -704,7 +732,10 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     log(`bt failed for ${target}: ${why}`);
     await sendText(`旁问(工具)失败 ${tag}：${why}`);
   } finally {
-    if (forkID) await client().session.remove({ sessionID: forkID }).catch(() => {});
+    if (forkID) {
+      asideIds.delete(forkID);
+      await client().session.remove({ sessionID: forkID }).catch(() => {});
+    }
   }
 }
 

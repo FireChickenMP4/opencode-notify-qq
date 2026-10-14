@@ -299,3 +299,23 @@ bridge 用 orm.created / orm.replied / orm.cancelled 维护待回答表，
   也就是通过既有的审批推送来问你，行为与普通回合一致。
 - 超时 `OPENCODE_NOTIFY_QQ_ASIDE_TIMEOUT_MS`（默认 300s），超时回一条「还没答完」。
 - 成本：fork 继承上下文，一次 `.bt` 的输入 token 约等于父会话上下文 + 工具往返；只想省 token 用 `.btw`。
+
+
+### .bt 首次真机测试暴露的两个 bug（已修）
+
+第一次从 QQ 发 `.bt` 的结果是：ack 发出、fork 干了活（74 条消息）、**答案没回推**，而且
+fork 抢走了会话编号（`.status` 显示成了 `#3`，`.ask #3` 真的打进了 fork）。
+
+1. **结束判定认错**：会话记录的最后一条不是 assistant，而是 `{type:"idle", outcome:"succeeded|failed"}`
+   （每轮末尾一条）。原来只认「最后一条是 assistant 且 finish !== "tool-calls"」，永远不成立 →
+   一直等到 300s 超时才放弃。现在：`tail` 里出现 `idle` 即算结束（并保留 finish 检查作为兜底）。
+   实测：57s 内正确判定。
+2. **fork 没有 parentID**：`session.fork` 产生的会话 parentID 为空，所以对 bridge 与通知插件来说
+   它就是一个全新的普通会话 —— 会拿编号、会抢「最近会话（默认目标）」，插件还会为它推一条
+   「完成」。现在：`asideIds` 让 bridge 既不给编号、也不把它记为默认目标；fork 上写
+   `metadata: { aside: true }` + 标题 `旁问 · …`，插件据此静默。
+
+另外两个小改进：
+
+- `.bt` 回复的标题固定带上目标会话编号 `#N`（aside 本身是临时的，不留编号，编号要取自目标会话）。
+- `.bt` 的 ack 与答案都带 `[#N 目录]` 标签。
