@@ -840,7 +840,18 @@ async function sendStatus(target?: number): Promise<void> {
  * up in the real transcript. Runs detached: a tool-using turn takes minutes, and
  * `.stop` plus approvals must not queue behind it.
  */
-async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<void> {
+type AsideRun = { forkID?: string; forkNum?: number; answer: string; finished: boolean; error?: string };
+
+/**
+ * Run one aside to completion: fork the session, scope it, ask, wait, read the
+ * answer, then delete the fork and its sandbox. Never throws - both callers (QQ
+ * `.bt` and the TUI `/bt`) have to say something either way.
+ */
+async function runAsideCore(
+  target: string,
+  question: string,
+  onReady?: (info: { forkNum?: number; agent: string; agentError?: string }) => Promise<void> | void,
+): Promise<AsideRun> {
   let forkID: string | undefined;
   let forkNum: number | undefined;
   try {
@@ -850,10 +861,9 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
 
     // Register before anything else can report it: to us a fork must never become
     // the default target, and the metadata is what the plugins read to stay quiet
-    // about it. It does get a number, so the ack can name the branch.
+    // about it. It does get a number, so a reply can name the branch.
     asideIds.add(forkID);
     forkNum = rememberSession(forkID);
-    await sendText(`旁问(工具)已发出：分支 #${forkNum} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
 
     const config = loadConfig();
     const sandbox = asideSandbox(forkID);
@@ -862,15 +872,16 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     // A fork inherits the session's agent, whose toolset may have no file access
     // at all - the aside would then be unable to read anything. Switch it to a
     // known-good agent unless the config says to inherit.
+    let agentError: string | undefined;
     if (config.asideAgent !== "inherit") {
       try {
         await client().session.switchAgent({ sessionID: forkID, agent: config.asideAgent });
       } catch (cause) {
-        const why = cause instanceof Error ? cause.message : String(cause);
-        log(`aside agent switch to ${config.asideAgent} failed: ${why}`);
-        await sendText(`旁问问不到 ${config.asideAgent} agent（${why}），这轮沿用会话自己的 agent，工具可能不全`);
+        agentError = cause instanceof Error ? cause.message : String(cause);
+        log(`aside agent switch to ${config.asideAgent} failed: ${agentError}`);
       }
     }
+    if (onReady) await onReady({ forkNum, agent: config.asideAgent, agentError });
 
     const rules = asideRules(config.asideTools, sandbox);
     await client().session.update({
@@ -887,23 +898,11 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     });
     const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
     const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();
-    const body = answer
-      ? answer.length > 3500
-        ? `${answer.slice(0, 3500)}...`
-        : answer
-      : finished
-        ? "(没有内容)"
-        : "(超时 —— 这一轮还没答完，先用 .status 看看)";
-    // Name the session the question was asked about, and the branch it runs in:
-    // the branch is throwaway but addressable (`.stop #N`) while it works.
-    const asked = num !== undefined ? `问 #${num}` : "问当前会话";
-    const heading = `**opencode · 旁问(工具) · ${asked}**`;
-    await sendWithRetry(`${heading}\n\n\`分支 #${forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${body}`);
-    log(`bt answered for ${target} via ${forkID} (${finished ? "done" : "timeout"}): ${preview(question)}`);
+    return { forkID, forkNum, answer, finished };
   } catch (cause) {
-    const why = cause instanceof Error ? cause.message : String(cause);
-    log(`bt failed for ${target}: ${why}`);
-    await sendText(`旁问(工具)失败 ${tag}：${why}`);
+    const error = cause instanceof Error ? cause.message : String(cause);
+    log(`aside failed for ${target}: ${error}`);
+    return { forkID, forkNum, answer: "", finished: false, error };
   } finally {
     if (forkID) {
       asideIds.delete(forkID);
@@ -914,6 +913,54 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
         /* a handle may still hold the directory; leaving it is harmless */
       }
     }
+  }
+}
+
+/** The closing text of an aside, with the reason when there is none. */
+function asideBody(run: AsideRun, max = 3500): string {
+  if (!run.answer) return run.finished ? "(没有内容)" : "(超时 —— 这一轮还没答完，先用 .status 看看)";
+  return run.answer.length > max ? `${run.answer.slice(0, max)}...` : run.answer;
+}
+
+/**
+ * `.bt` from QQ: acknowledge with the branch and its agent, run, push the answer.
+ *
+ * Detached by the caller: a tool-using turn takes minutes, and `.stop` plus
+ * approvals must not queue behind it.
+ */
+async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<void> {
+  const run = await runAsideCore(target, question, async ({ forkNum, agent, agentError }) => {
+    const who = agentError
+      ? `agent 换不上（${agentError}），沿用会话自己的`
+      : agent === "inherit"
+        ? "agent 沿用会话自己的"
+        : `agent ${agent}`;
+    await sendText(`旁问(工具)已发出：分支 #${forkNum} · ${who} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
+  });
+  if (run.error) {
+    await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
+    return;
+  }
+  const asked = num !== undefined ? `问 #${num}` : "问当前会话";
+  await sendWithRetry(
+    `**opencode · 旁问(工具) · ${asked}**\n\n\`分支 #${run.forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${asideBody(run)}`,
+  );
+  log(`bt answered for ${target} via ${run.forkID} (${run.finished ? "done" : "timeout"}): ${preview(question)}`);
+}
+
+/**
+ * `/bt` from the TUI: the same run, but the answer goes back into the session it
+ * was asked from, as a synthetic message.
+ */
+async function runAsideTui(sessionID: string, question: string): Promise<void> {
+  const run = await runAsideCore(sessionID, question);
+  const branch = run.forkNum !== undefined ? `（分支 #${run.forkNum}）` : "";
+  const body = run.error ? `失败：${run.error}` : asideBody(run, 12_000);
+  try {
+    await client().session.synthetic({ sessionID, text: `**旁问${branch}**\n\n${body}` });
+    log(`bt(tui) answered for ${sessionID}: ${preview(question)}`);
+  } catch (cause) {
+    log(`bt(tui) could not post the answer: ${cause instanceof Error ? cause.message : cause}`);
   }
 }
 
@@ -1481,13 +1528,31 @@ async function run(): Promise<number> {
   // the OS guarantees uniqueness and releases it when the process dies, so
   // there are no stale PID files to reason about.
   //
-  // The listener type is written structurally (only `stop` is used) because
-  // `Bun.listen` is overloaded for TCP and Unix sockets and `ReturnType` of an
-  // overloaded function picks the wrong one.
-  type LockListener = { stop(closeActiveConnections?: boolean): void };
-  let lock: LockListener | null = null;
+  // The listener type is written structurally (only `stop` is used) rather than
+  // importing Bun's server type for one method.
+  type BridgeServer = { stop(closeActiveConnections?: boolean): void };
+  let server: BridgeServer | null = null;
   try {
-    lock = Bun.listen<undefined>({ hostname: "127.0.0.1", port: LOCK_PORT, socket: { data() {} } });
+    // The bound port is the single-instance lock (the OS releases it when the
+    // process dies) and it doubles as the endpoint the TUI's `/bt` calls - the
+    // aside logic lives here, so the plugin only has to ask.
+    server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: LOCK_PORT,
+      fetch: async (req) => {
+        const url = new URL(req.url);
+        if (req.method === "POST" && url.pathname === "/aside") {
+          const body = (await req.json().catch(() => null)) as { sessionID?: string; question?: string } | null;
+          if (!body?.sessionID || !body.question) {
+            return Response.json({ error: "sessionID and question are required" }, { status: 400 });
+          }
+          // Detached: the answer lands in the session once it is ready.
+          void runAsideTui(body.sessionID, body.question);
+          return Response.json({ ok: true });
+        }
+        return new Response("opencode-notify-qq bridge\n");
+      },
+    });
   } catch {
     console.error(`another bridge is already running (port ${LOCK_PORT} is in use).`);
     console.error(`stop it first, or set OPENCODE_NOTIFY_QQ_LOCK_PORT to a free port.`);
@@ -1504,7 +1569,7 @@ async function run(): Promise<number> {
     await client.connect();
   } catch (cause) {
     console.error(`failed to start: ${cause instanceof Error ? cause.message : cause}`);
-    lock.stop(true);
+    server.stop(true);
     return 1;
   }
   log(`QQ gateway connected (lock port ${LOCK_PORT})`);
@@ -1513,7 +1578,7 @@ async function run(): Promise<number> {
   const stop = () => {
     abort.abort();
     client.close();
-    lock?.stop(true);
+    server?.stop(true);
     process.exit(0);
   };
   process.on("SIGINT", stop);
