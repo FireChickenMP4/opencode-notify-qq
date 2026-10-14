@@ -307,6 +307,11 @@ describe("turnEnded", () => {
     expect(turnEnded([tool(), A("stop")])).toBe(true);
   });
 
+  test("an idle marker that is not the last message does not end it", () => {
+    // The shape of a turn that paused for an approval and then carried on.
+    expect(turnEnded([idle(), tool()])).toBe(false);
+  });
+
   test("a tool round is not the end", () => {
     expect(turnEnded([tool()])).toBe(false);
   });

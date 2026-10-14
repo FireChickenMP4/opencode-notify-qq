@@ -626,25 +626,41 @@ export function lastAssistantText(msgs: Msg[], from: number): string {
  */
 export function turnEnded(tail: Msg[]): boolean {
   if (!tail.some((m) => m.type === "assistant")) return false;
-  if (tail.some((m) => m.type === "idle")) return true;
+  // The idle marker only ends the turn when it is the LAST message. A turn that
+  // pauses for an approval writes one too, and treating that as "answered" is
+  // exactly how an aside got its branch deleted while the approval was still on
+  // the phone.
+  if (tail[tail.length - 1]?.type === "idle") return true;
   return tail.some(
     (m) => m.type === "assistant" && Boolean(m.finish) && m.finish !== "tool-calls" && Boolean(m.time?.completed),
   );
 }
 
+/** Is this session waiting for an approval right now? */
+function sessionHasPending(sessionID: string): boolean {
+  for (const p of pending.values()) if (p.sessionID === sessionID) return true;
+  return false;
+}
+
 /**
- * Poll the fork's transcript until its turn is over. Reading the transcript
- * keeps this off the event bookkeeping, which only tracks sessions we are told
- * about.
+ * Poll the fork's transcript until its turn is over. Reading the transcript keeps
+ * this off the event bookkeeping, which only tracks sessions we are told about.
+ *
+ * Time spent waiting for the user's approval does not count against the timeout:
+ * an aside that stopped to ask is not a stuck aside.
  */
 async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  let deadline = Date.now() + timeoutMs;
+  for (;;) {
     await sleep(700);
+    if (sessionHasPending(sessionID)) {
+      deadline = Date.now() + timeoutMs;
+      continue;
+    }
     const msgs = await sessionMessages(sessionID).catch(() => [] as Msg[]);
     if (turnEnded(msgs.slice(baseline))) return true;
+    if (Date.now() >= deadline) return false;
   }
-  return false;
 }
 
 /**
