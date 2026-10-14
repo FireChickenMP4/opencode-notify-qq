@@ -204,3 +204,35 @@ bridge 必须单例的原因。
 | **opencode-notify-qq** | QQ | 人不在电脑前 |
 
 两者独立，可同时装。
+
+
+---
+
+## V2 迁移（opencode 2.x）
+
+本节只记录 V2 下与上文 V1 设计不同的地方；上文的 V1 记录保留作历史。
+
+- **不再需要 `opencode serve` + `opencode attach`**。V2 有常驻后台服务，服务自己注册
+  url + 密码（`~/.local/state/opencode/service.json`）；bridge 用 `@opencode/client` 的
+  `Service.discover()` 找到它、`Service.headers()` 带 Basic 鉴权，断线重连时会重新发现
+  （服务重启会换端口）。
+- **接口替换**（V1 -> V2）：
+  - `GET /session?limit=N` -> `session.list()`，响应是 `{data, cursor}`
+  - `GET /session/{id}/message` -> `session.context({sessionID})`（消息是 tagged 的
+    `{type, content}`，不再是 `{info, parts}`）
+  - `POST /session/{id}/abort` -> `session.interrupt({sessionID})`
+  - `POST /session/{id}/prompt_async` -> `session.prompt({sessionID, text})`
+  - `GET /permission` -> `permission.request.list()`（`{location, data}`）
+  - `POST /session/{id}/permissions/{req}` -> `permission.reply({sessionID, requestID, decision})`
+    （注意字段名是 **`decision`**，值 `once` / `always` / `reject`）
+- **`GET /session/status` 在 V2 不存在**。忙/闲改为：`session.step.started` 置忙、
+  `session.step.ended` 且 `finish` 不是 `tool-calls` 置闲，再用 `session.active()` 兜底校准。
+- **回合结束信号**：V2 的公开事件流里没有 `session.idle` / `session.status`，改用
+  `session.step.ended` 的 `finish`。重试告警从 `status.type === "retry"` 改为
+  `session.retry.scheduled`。
+- **新增 QQ 指令 `.btw <问题>`**：调 `session.generate({sessionID, prompt})` 拿一次性回答，
+  不写进对话也不打断回合。
+- **`.task` 投递**仍是 bridge 自己排队、回合结束才送；`prompt` 不再显式传 agent
+  （V2 里 agent 是会话属性）。**这一条未实测**，若 `.task` 不生效先看这里。
+- **诊断**：`.stop` / `.task` / `.btw` / `.status` 的用法不变；`--check` 现在校验的是
+  「服务发现 + 鉴权 + 待审批列表」。

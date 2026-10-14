@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, promptPath, renderTranscript } from "../src/bridge";
+import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, renderTranscript } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -51,9 +51,10 @@ describe("parseReply", () => {
 });
 
 describe("parseCommand", () => {
-  test("task and ask carry their body", () => {
+  test("task, ask and btw carry their body", () => {
     expect(parseCommand(".task fix the bug")).toEqual({ kind: "task", text: "fix the bug" });
     expect(parseCommand(".ask what about x")).toEqual({ kind: "ask", text: "what about x" });
+    expect(parseCommand(".btw why did it fail")).toEqual({ kind: "btw", text: "why did it fail" });
   });
 
   test("stop takes no body", () => {
@@ -91,15 +92,17 @@ describe("parseCommand", () => {
     expect(parseCommand(".task 2 things to do")).toEqual({ kind: "task", text: "2 things to do" });
   });
 
-  test("a bare .task with no body is not a command", () => {
+  test("a bare .task or .btw with no body is not a command", () => {
     expect(parseCommand(".task")).toBeUndefined();
     expect(parseCommand(".ask   ")).toBeUndefined();
+    expect(parseCommand(".btw")).toBeUndefined();
   });
 
   test("does not swallow o/a/r or chatter", () => {
     expect(parseCommand("o")).toBeUndefined();
     expect(parseCommand("hello")).toBeUndefined();
     expect(parseCommand(".taskx no")).toBeUndefined();
+    expect(parseCommand(".btwx no")).toBeUndefined();
     expect(parseCommand(".statusx")).toBeUndefined();
   });
 });
@@ -115,14 +118,18 @@ describe("status formatting", () => {
 
   test("transcript labels reasoning, output and tools, skips user text", () => {
     const out = renderTranscript([
-      { info: { role: "user" }, parts: [{ type: "text", text: "hi there" }] },
+      { type: "user", text: "hi there" },
       {
-        info: { role: "assistant" },
-        parts: [
-          { type: "step-start" },
+        type: "assistant",
+        content: [
           { type: "reasoning", text: "let me think" },
           { type: "text", text: "here is the answer" },
-          { type: "tool", tool: "edit", state: { status: "completed", title: "app/x.go" } },
+          {
+            type: "tool",
+            name: "edit",
+            state: { status: "completed", input: { filePath: "app/x.go" } },
+            time: { created: 1, completed: 2 },
+          },
         ],
       },
     ]);
@@ -137,8 +144,10 @@ describe("status formatting", () => {
     const start = Date.now() - 120_000;
     const out = renderTranscript([
       {
-        info: { role: "assistant" },
-        parts: [{ type: "tool", tool: "bash", state: { status: "running", input: { command: "sleep 999" }, time: { start } } }],
+        type: "assistant",
+        content: [
+          { type: "tool", name: "bash", state: { status: "running", input: { command: "sleep 999" } }, time: { created: start } },
+        ],
       },
     ]);
     expect(out[0]).toContain("bash [运行中");
@@ -147,12 +156,12 @@ describe("status formatting", () => {
   });
 
   test("keeps only the last maxLines transcript lines", () => {
-    const parts = Array.from({ length: 5 }, (_, i) => ({
+    const content = Array.from({ length: 5 }, (_, i) => ({
       type: "tool",
-      tool: "bash",
-      state: { status: "completed", title: `c${i}` },
+      name: "bash",
+      state: { status: "completed", input: { command: `c${i}` } },
     }));
-    const out = renderTranscript([{ info: { role: "assistant" }, parts }], 3);
+    const out = renderTranscript([{ type: "assistant", content }], 3);
     expect(out).toEqual(["工具> bash [完成] c2", "工具> bash [完成] c3", "工具> bash [完成] c4"]);
   });
 
@@ -191,14 +200,5 @@ describe("parseReply Chinese dot", () => {
   test("。a is accepted like .a", () => {
     expect(parseReply("。a")).toBe("always");
     expect(parseReply("。r")).toBe("reject");
-  });
-});
-
-describe("promptPath", () => {
-  test("uses prompt_async, not the no-op v2 admit route", () => {
-    // The v2 `/api/session/{id}/prompt` accepts a prompt and returns an
-    // admittedSeq but never delivers it. Regression guard.
-    expect(promptPath("ses_abc")).toBe("/session/ses_abc/prompt_async");
-    expect(promptPath("ses_abc")).not.toContain("/api/session/");
   });
 });

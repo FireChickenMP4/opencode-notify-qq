@@ -76,9 +76,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 插件在启动时加载。重启后 agent 就有 `notify_qq` 工具了。
 
-> **注意：plugin 由 `opencode serve` 进程加载，不是 attach 的 TUI。**
-> 若你用 `opencode attach <url>` 连着自己的 serve，改插件后**只重启 TUI 不生效**，
-> 必须重启 `serve`（或裸 `opencode`）。判断方法：
+> **改了 `src/` 下的支撑模块（含 `bridge.ts`）必须重启 opencode 服务才生效**：
+> opencode 的热重载只重新执行插件文件本身，它 import 的模块会留在进程缓存里。
+> 判断方法：
 > `Select-String -Path "$env:USERPROFILE\.local\share\opencode\log\opencode.log" -Pattern 'notify_qq tool registered'`
 > 看最后一条加载时间是否晚于你改文件的时间。
 
@@ -159,18 +159,13 @@ bun run src/listen.ts 60                   # 监听事件（抓 openid 用）
 
 ## 远程审批（bridge）
 
-不开 opencode 的 HTTP API 之外的东西：跑一个 server，`bridge` 订阅它的事件，
-把待审批的请求推到 QQ，你回一个字就批准/拒绝。
+`bridge` 订阅 opencode 服务的事件流，把待审批的请求推到 QQ，你回一个字就批准/拒绝。
 
 ### 启动
 
-```powershell
-# 1. 起 server（一个进程承载所有 TUI；plugin 只实例化一次）
-opencode serve --port 4096
-
-# 2. attach（想开几个开几个；插件会自动拉起 bridge，无需手动起）
-opencode attach http://127.0.0.1:4096
-```
+**什么都不用手动起。** opencode V2 自带常驻后台服务（服务自己注册 url 与密码），
+插件会自动拉起 bridge；bridge 再用 `@opencode/client` 的 `Service.discover()`
+找到那台服务并带上 Basic 鉴权——**不需要手动 `opencode serve`，也不需要 attach**。
 
 **bridge 由插件自动确保在跑**，你不用手动起：
 
@@ -182,9 +177,8 @@ opencode attach http://127.0.0.1:4096
 手动控制（可选）：
 
 ```powershell
-$env:OPENCODE_SERVER_URL = "http://127.0.0.1:4096"
 bun run src/bridge.ts              # 手动起
-bun run src/bridge.ts --check      # 验证配置 + 凭据 + server 可达
+bun run src/bridge.ts --check      # 验证配置 + 凭据 + 服务可达
 ```
 
 关掉自动拉起：`OPENCODE_NOTIFY_QQ_BRIDGE=0`。
@@ -221,14 +215,14 @@ QQ 发以 `.` 开头的消息：
 
 | 指令 | 效果 |
 |---|---|
-| `.task <内容>` | 派任务，**排队到本轮结束**（`delivery:"queue"`） |
-| `.ask <内容>` | 立即插话（`delivery:"steer"`）；会话空闲时与 `.task` 等效 |
-| `.stop` | 中断当前执行（`abort`），最高优先级 |
-| `.restart` | 中断并让 agent 重新陈述计划、继续 |
+| `.task <内容>` | 派任务，**排队到本轮结束**（bridge 自己排队，回合结束才送出） |
+| `.ask <内容>` | 立即插话进正在跑的回合；会话空闲时与 `.task` 等效 |
+| `.btw <问题>` | **旁问**：用会话上下文一次性回答，不进对话、不打断回合（会花一次模型调用） |
+| `.stop` | 中断当前执行，最高优先级 |
 | `.status` | 查会话状态：运行中/空闲、最近十几行内容（`思考>`/`输出>`/`工具>`）、工具久跑标「可能卡住」 |
 
-**目标会话**：bridge 用**最近一次收到权限事件的会话**。多会话时如需显式指定，
-先加 `#<会话短id>`（待实现）。
+**目标会话**：默认用**最近一次收到事件的会话**；多会话时显式指定 `#<短编号>`，
+例如 `.stop #2`、`.task #1 deploy it`、`.btw #3 这是啥`。
 
 ### 回合结束的总结
 
@@ -249,16 +243,20 @@ opencode · 完成 [D:\Desktop\workflow]
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `NOTIFY_QQ_CONFIG` | `~/.config/opencode/notify-qq.json` | 配置路径 |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4096` | bridge 连的 opencode server |
-| `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口 |
+| `OPENCODE_NOTIFY_QQ_DEDUP_MS` | `5000` | 同类通知去抖窗口（跨重复加载的实例生效） |
+| `OPENCODE_NOTIFY_QQ_PERMISSION_GRACE_MS` | `1500` | 仅在 `cli.json` 设为 `autoaccept` 时生效：等此时长确认权限是否已被自动批准 |
+| `OPENCODE_NOTIFY_QQ_BASH_MS` | `90000` | bash 久跑告警阈值，设 `0` 关闭 |
+| `OPENCODE_NOTIFY_QQ_RETRY_MS` | `60000` | 持续重试多久才提醒一次 |
+| `OPENCODE_NOTIFY_QQ_MAX_CHARS` | `4000` | 完成推送正文的截断长度 |
 | `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
 | `OPENCODE_NOTIFY_QQ_LOCK_PORT` | `4097` | bridge 单例锁端口 |
 | `OPENCODE_NOTIFY_QQ_BRIDGE` | `1` | 设 `0` 不自动拉起 bridge |
 | `OPENCODE_NOTIFY_QQ_SUMMARY` | `1` | 设 `0` 完成通知不带总结 |
 | `OPENCODE_NOTIFY_QQ_LOG` | `1` | 设 `0` 关闭事件日志 |
 
-事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录每个
-`permission.asked` / idle 事件与发送结果——"该通知却没通知"时先看它。
+事件日志在 `~/.config/opencode/plugins/notify-qq.events.log`，记录
+`permission.asked`、`session.retry.scheduled`、回合结束（`session.step.ended` 且
+`finish` 不是 `tool-calls`）以及每次发送结果与去抖决定——"该通知却没通知"时先看它。
 
 ## 已知限制
 
@@ -276,11 +274,11 @@ src/
   notify-qq.ps1   # 快捷开关 CLI（on/off/status/toggle）
   notify.ts       # 推送 / 校验 CLI
   listen.ts       # 有界监听（抓 openid、调试事件）
-  bridge.ts       # 远程审批 daemon（SSE + QQ，单例）
+  bridge.ts       # 远程审批 daemon（事件流 + QQ，单例）
   bridge.test.ts  # 回复解析单测
   lock.test.ts    # 单例锁单测
 plugins/
-  notify-qq.ts    # opencode plugin：notify_qq 工具 + idle 钩子 + 命令
+  notify-qq.ts    # opencode plugin：notify_qq 工具 + 回合完成钩子 + 命令
 install.ps1       # 一键安装
 PLAN.md           # 设计取舍与后续规划
 ```

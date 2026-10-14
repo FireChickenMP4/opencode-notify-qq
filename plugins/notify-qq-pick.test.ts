@@ -11,8 +11,8 @@ import { describe, expect, test } from "bun:test";
 
 import { pickFallbackText, pickFinalText } from "../src/notify-helpers";
 
-const A = (parts: Array<{ type: string; text?: string }>) => ({ info: { role: "assistant" }, parts });
-const U = (text: string) => ({ info: { role: "user" }, parts: [{ type: "text", text }] });
+const A = (content: Array<{ type: string; text?: string }>) => ({ type: "assistant", content });
+const U = (text: string) => ({ type: "user", text });
 
 describe("pickFinalText", () => {
   test("takes the last text-only assistant message", () => {
@@ -61,6 +61,18 @@ describe("pickFinalText", () => {
       U("injected 2"),
     ];
     expect(pickFinalText(msgs)).toBe("answer");
+  });
+
+  test("ignores a trailing V2 turn-end marker too", () => {
+    // V2 appends messages of their own kind at a turn boundary; only a reply
+    // should stop the backward scan.
+    const msgs = [
+      U("go"),
+      A([{ type: "text", text: "the answer" }]),
+      U(".task do the next thing"),
+      { type: "idle" },
+    ];
+    expect(pickFinalText(msgs)).toBe("the answer");
   });
 
   test("joins multiple text parts of the chosen message", () => {

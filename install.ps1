@@ -30,9 +30,8 @@ Write-Output "target:          $pluginsDir"
 
 New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
 
-# Every module the plugin imports at runtime must travel with it. The plugin
-# file itself exports only NotifyQqPlugin; helpers live in src/ so opencode does
-# not mistake a named export for a plugin function.
+# Every module the plugin and the bridge import at runtime must travel with them.
+# The plugin file keeps a single default export; helpers live in src/.
 $modules = @(
     "qqbot.ts", "config.ts", "sessions.ts", "task-queue.ts",
     "deliver.ts", "bash-watch.ts", "notify-helpers.ts", "bridge.ts"
@@ -42,6 +41,20 @@ foreach ($m in $modules) {
 }
 Copy-Item (Join-Path $repo "plugins\notify-qq.ts") (Join-Path $pluginsDir "notify-qq.ts") -Force
 Copy-Item (Join-Path $repo "src\notify-qq.ps1") (Join-Path $srcDir "notify-qq.ps1") -Force
+
+# Runtime deps must be resolvable from the installed plugin and bridge; they are
+# not bundled. bridge.ts imports @opencode/client to find and authenticate the
+# local opencode service.
+# Note: install one at a time - `npm install <a> <b>` with an array splats each
+# element as a separate arg AND can split single-char names, installing junk.
+$deps = @("@opencode/client")
+foreach ($dep in $deps) {
+    if (-not (Test-Path (Join-Path $configDir "node_modules\$dep"))) {
+        Write-Output "installing missing dep into the global config: $dep..."
+        $env:NODE_OPTIONS = "--use-system-ca"
+        & npm install $dep --prefix $configDir --no-audit --no-fund | Out-Null
+    }
+}
 
 # Shell function so `notify-qq on|off|status` works in any terminal.
 #

@@ -1,11 +1,9 @@
 /**
  * Pure helpers used by the notify-qq plugin.
  *
- * These live OUTSIDE plugins/ on purpose. opencode treats EVERY named export of
- * a file in `plugins/` as a plugin function and calls it with no arguments, so a
- * helper exported from the plugin file gets invoked as `helper(undefined, ...)`
- * and throws at load time (`text.replace is not a function`). Keeping them in a
- * sibling module means the plugin file exports only `NotifyQqPlugin`.
+ * These live OUTSIDE plugins/ on purpose, so the plugin file keeps a single
+ * default export; the plugin imports them from a sibling module (repo `../src`,
+ * installed `./notify-qq/`).
  */
 
 import { readFileSync } from "node:fs";
@@ -36,24 +34,33 @@ export function runningBridgeIsCurrent(statePath: string, hash: string): boolean
 }
 
 /**
+ * The message shapes the pickers read. V2 tags each message with `type` and
+ * keeps assistant output in `content`; every other message kind is ignored.
+ */
+export type SessionMessage = {
+  type?: string;
+  content?: Array<{ type?: string; text?: string }>;
+};
+
+export type MessageList = readonly SessionMessage[];
+
+/**
  * Pick the turn's closing text from a message list.
  *
  * Rule: the LAST assistant message that has text and no tool part. A message
- * that calls a tool is not a conclusion, so it is skipped. Trailing user
- * messages with no reply yet (e.g. an injected `.task`) are skipped first, so
- * the idle-race push still shows the prior reply.
+ * that calls a tool is not a conclusion, so it is skipped. Trailing messages
+ * that are not assistant replies are skipped first - an injected remote task,
+ * or a V2 turn-end marker - so the race push still shows the prior reply.
  */
-export function pickFinalText(
-  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
-): string {
+export function pickFinalText(messages: MessageList): string {
   let start = messages.length - 1;
-  while (start >= 0 && messages[start]?.info?.role === "user") start--;
+  while (start >= 0 && messages[start]?.type !== "assistant") start--;
 
   for (let i = start; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.info?.role === "user") break;
-    if (m.info?.role !== "assistant") continue;
-    const parts = m.parts ?? [];
+    if (m.type === "user") break;
+    if (m.type !== "assistant") continue;
+    const parts = m.content ?? [];
     if (parts.some((p) => p.type === "tool")) continue;
     const text = parts
       .filter((p) => p.type === "text" && p.text?.trim())
@@ -72,17 +79,15 @@ export function pickFinalText(
  * a tool message and has no text-only message, so the push would otherwise show
  * no body.
  */
-export function pickFallbackText(
-  messages: Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>,
-): string {
+export function pickFallbackText(messages: MessageList): string {
   let start = messages.length - 1;
-  while (start >= 0 && messages[start]?.info?.role === "user") start--;
+  while (start >= 0 && messages[start]?.type !== "assistant") start--;
 
   for (let i = start; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.info?.role === "user") break;
-    if (m.info?.role !== "assistant") continue;
-    const texts = (m.parts ?? []).filter((p) => p.type === "text" && p.text?.trim());
+    if (m.type === "user") break;
+    if (m.type !== "assistant") continue;
+    const texts = (m.content ?? []).filter((p) => p.type === "text" && p.text?.trim());
     const last = texts[texts.length - 1];
     if (last?.text?.trim()) return last.text.trim();
   }

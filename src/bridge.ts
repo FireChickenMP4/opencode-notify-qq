@@ -2,8 +2,12 @@
  * bridge: single-process daemon for remote permission approval over QQ.
  *
  * It holds the one and only QQ gateway (WSS) connection, subscribes to the
- * opencode server's SSE stream, pushes pending permission requests to QQ, and
- * maps a one-letter QQ reply back to `POST /permission/{id}/reply`.
+ * opencode service's event stream, pushes pending permission requests to QQ, and
+ * maps a one-letter QQ reply back to the permission reply API.
+ *
+ * The service is found the same way the CLI finds it: it registers itself (url +
+ * password) and `Service.discover()` reads that registration, so no fixed port
+ * and no manual `opencode serve` + attach is involved.
  *
  * Only one process may hold the WSS connection: a second Identify on the same
  * shard triggers `op 9 Invalid Session` and kicks the older one (see PLAN.md
@@ -11,20 +15,47 @@
  *
  * Usage:
  *   bun run src/bridge.ts            # start the daemon
- *   bun run src/bridge.ts --check    # verify config + token + server, then exit
+ *   bun run src/bridge.ts --check    # verify config + token + service, then exit
  *   bun run src/bridge.ts --help
  */
 
 import { writeFileSync } from "node:fs";
+import { OpenCode } from "@opencode/client/promise";
+import { headers, Service } from "@opencode/client/service";
 import { configPath, loadConfig } from "./config";
 import { QqBotClient, getAccessToken, sendMarkdown, sendText, type GatewayEvent } from "./qqbot";
 import { SessionNumbers, sessionNumbersPath } from "./sessions";
 import { TaskQueue } from "./task-queue";
 
-const BASE = (process.env.OPENCODE_SERVER_URL?.trim() || "http://127.0.0.1:4096").replace(
-  /\/$/,
-  "",
-);
+type OcClient = ReturnType<typeof OpenCode.make>;
+
+/**
+ * The opencode client, pointed at whichever local service is running.
+ *
+ * V2 has no fixed port: the service registers itself (url + password), and
+ * `Service.discover()` reads that registration. It is re-resolved on every
+ * reconnect, because a restarted service comes back on a different port.
+ */
+let oc: OcClient | null = null;
+
+async function connectClient(): Promise<OcClient> {
+  const endpoint = await Service.discover();
+  if (!endpoint) {
+    throw new Error("no local opencode service found (start opencode, or `opencode service restart`)");
+  }
+  oc = OpenCode.make({ baseUrl: endpoint.url, headers: headers(endpoint) });
+  return oc;
+}
+
+/** The current client; every caller runs after `connectClient`. */
+function client(): OcClient {
+  if (!oc) throw new Error("opencode client not connected");
+  return oc;
+}
+
+function asString(v: unknown): string | undefined {
+  return typeof v === "string" && v ? v : undefined;
+}
 
 /**
  * TCP port used purely as a single-instance lock. Not a service; any connection
@@ -73,7 +104,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // opencode HTTP client
 // ---------------------------------------------------------------------------
 
-type OpencodeEvent = { id?: string; type?: string; properties?: Record<string, unknown> };
+type OpencodeEvent = { id?: string; type?: string; data?: Record<string, unknown> };
 type Session = { id: string; directory?: string; agent?: string; parentID?: string };
 
 let sessions: Session[] | null = null;
@@ -82,16 +113,19 @@ let sessionsAt = 0;
 /**
  * All sessions, cached briefly.
  *
- * `limit` is raised because the default page (100) is too small to decide which
+ * `limit` is raised because the default page is too small to decide which
  * sessions are still alive for numbering reclamation.
  */
 async function allSessions(): Promise<Session[]> {
   if (!sessions || Date.now() - sessionsAt > 60_000) {
-    const res = await fetch(`${BASE}/session?limit=1000`);
-    if (res.ok) {
-      sessions = (await res.json()) as Session[];
-      sessionsAt = Date.now();
-    }
+    const page = await client().session.list({ limit: 1000 });
+    sessions = (page.data ?? []).map((s) => ({
+      id: s.id,
+      directory: s.location?.directory,
+      agent: s.agent,
+      parentID: s.parentID,
+    }));
+    sessionsAt = Date.now();
   }
   return sessions ?? [];
 }
@@ -106,26 +140,38 @@ async function sessionDirectory(sessionID: string): Promise<string> {
 }
 
 /**
- * True while the session has a turn running.
+ * Busy-ness, observed and then calibrated against the server.
  *
- * On a failed status lookup this returns TRUE (assume busy). The two mistakes
- * are not equal: wrongly queueing is harmless (the message waits for an idle
- * that will come), while wrongly assuming idle injects the message straight
- * into the turn - turning `.task` into an interruption, which is the opposite
- * of what it means.
+ * V1 asked `GET /session/status`, which V2 does not have. A step starting means
+ * work is in flight; a step that ends without wanting a tool call means the turn
+ * is over. `session.active()` reports the drains this process owns, and is only
+ * consulted as a fallback.
+ *
+ * On a failed probe this returns TRUE (assume busy). The two mistakes are not
+ * equal: wrongly queueing is harmless (the message waits for an idle that will
+ * come), while wrongly assuming idle injects the message straight into the turn -
+ * turning `.task` into an interruption, which is the opposite of what it means.
  */
+const busySessions = new Set<string>();
+
+function noteBusy(sessionID: string | undefined, busy: boolean): void {
+  if (!sessionID) return;
+  if (busy) busySessions.add(sessionID);
+  else busySessions.delete(sessionID);
+}
+
 async function sessionIsBusy(sessionID: string): Promise<boolean> {
+  if (busySessions.has(sessionID)) return true;
   try {
-    const res = await fetch(`${BASE}/session/status`);
-    if (!res.ok) return true;
-    const all = (await res.json()) as Record<string, { type?: string }>;
-    const t = all[sessionID]?.type;
-    // Absent from the map means no runner is active -> idle.
-    if (!(sessionID in all)) return false;
-    return t === "busy" || t === "retry";
+    const active = await client().session.active();
+    if (sessionID in active) {
+      busySessions.add(sessionID);
+      return true;
+    }
   } catch {
     return true;
   }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +217,7 @@ export function parseReply(text: string): Verdict | undefined {
 // ---------------------------------------------------------------------------
 
 export type Command =
-  | { kind: "task" | "ask"; text: string; target?: number }
+  | { kind: "task" | "ask" | "btw"; text: string; target?: number }
   | { kind: "stop"; target?: number }
   | { kind: "status"; target?: number };
 
@@ -181,6 +227,8 @@ export type Command =
  *
  *   .task <text>      queue a message; runs after the current turn (or now if idle)
  *   .ask  <text>      steer into the running turn immediately
+ *   .btw  <question>  one-shot answer from the session's context, without touching
+ *                     the conversation or the running turn
  *   .stop             abort the running turn (highest priority)
  *   .status           report the target session's turn/tool state (stuck detector)
  *
@@ -189,9 +237,9 @@ export type Command =
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|stop|status)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|stop|status)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "stop" | "status";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "stop" | "status";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -380,13 +428,21 @@ const PART_LINES = 4;
 /** Max characters per transcript line. */
 const LINE_CHARS = 120;
 
+/** V2 content parts: assistant output is tagged `text` | `reasoning` | `tool`. */
 type Part = {
   type?: string;
   text?: string;
-  tool?: string;
-  state?: { status?: string; title?: string; input?: { command?: string }; time?: { start?: number } };
+  name?: string;
+  state?: { status?: string; input?: Record<string, unknown> | string };
+  time?: { created?: number; ran?: number; completed?: number };
 };
-type Msg = { info?: { role?: string; time?: { created?: number; completed?: number } }; parts?: Part[] };
+/** V2 messages are tagged themselves; there is no `{ info, parts }` wrapper. */
+type Msg = {
+  type?: string;
+  text?: string;
+  content?: Part[];
+  time?: { created?: number; completed?: number };
+};
 
 /** Wrap a text blob into trimmed, capped display lines. */
 function clipLines(text: string): string[] {
@@ -399,24 +455,36 @@ function clipLines(text: string): string[] {
   return [...lines.slice(0, PART_LINES - 1), "…"];
 }
 
-/** One "工具> ..." line: name, status/timeout flag, and command or file. */
+/** One "工具> ..." line: name, status/stuck flag, and the command it runs. */
 function toolLine(p: Part): string {
   const status = p.state?.status;
-  const start = p.state?.time?.start;
+  const start = p.time?.ran ?? p.time?.created;
   let label: string;
-  if (status === "running") {
+  if (status === "running" || status === "streaming") {
     const ms = typeof start === "number" ? Date.now() - start : null;
     label = `运行中${ms != null ? ` ${fmtDuration(ms)}` : ""}${ms != null && ms > STUCK_MS ? "，可能卡住" : ""}`;
-  } else if (status === "pending") {
-    label = "排队";
   } else if (status === "error") {
     label = "失败";
-  } else {
+  } else if (status === "completed") {
     label = "完成";
+  } else {
+    label = status ?? "排队";
   }
-  const raw = typeof p.state?.input?.command === "string" ? p.state.input.command : p.state?.title;
-  const detail = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim().slice(0, 160) : "";
-  return `${p.tool ?? "?"} [${label}]${detail ? ` ${detail}` : ""}`;
+  // Tools put their subject in different input keys (shell: command, edit/read:
+  // filePath, glob/grep: pattern); show the first one that is a string.
+  const input = p.state?.input;
+  let raw = "";
+  if (typeof input === "object" && input !== null) {
+    for (const key of ["command", "filePath", "filepath", "path", "pattern", "url"]) {
+      const value = (input as Record<string, unknown>)[key];
+      if (typeof value === "string" && value) {
+        raw = value;
+        break;
+      }
+    }
+  }
+  const detail = raw.replace(/\s+/g, " ").trim().slice(0, 160);
+  return `${p.name ?? "?"} [${label}]${detail ? ` ${detail}` : ""}`;
 }
 
 /**
@@ -429,12 +497,12 @@ function toolLine(p: Part): string {
 export function renderTranscript(msgs: Msg[], maxLines = STATUS_LINES): string[] {
   const lines: string[] = [];
   for (const m of msgs) {
-    const isUser = m.info?.role === "user";
-    for (const p of m.parts ?? []) {
+    // User text is skipped: you already know what you sent.
+    if (m.type === "user") continue;
+    for (const p of m.content ?? []) {
       if (p.type === "reasoning" && p.text) {
         for (const l of clipLines(p.text)) lines.push(`思考> ${l}`);
       } else if (p.type === "text" && p.text) {
-        if (isUser) continue;
         for (const l of clipLines(p.text)) lines.push(`输出> ${l}`);
       } else if (p.type === "tool") {
         lines.push(`工具> ${toolLine(p)}`);
@@ -446,22 +514,21 @@ export function renderTranscript(msgs: Msg[], maxLines = STATUS_LINES): string[]
 
 type SessionSnapshot = { transcript: string[]; turnStart?: number; lastActivity?: number };
 
-/** Fetch recent messages and derive the transcript plus turn/last-activity times. */
+/** Fetch the transcript and derive the turn start plus last-activity times. */
 async function fetchSessionSnapshot(sessionID: string): Promise<SessionSnapshot> {
   try {
-    const res = await fetch(`${BASE}/session/${sessionID}/message?limit=10`);
-    if (!res.ok) return { transcript: [] };
-    const msgs = (await res.json()) as Msg[];
+    const msgs = (await client().session.context({ sessionID })) as unknown as Msg[];
+    if (!Array.isArray(msgs)) return { transcript: [] };
 
     let turnStart: number | undefined;
     for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i]?.info?.role === "user") {
-        turnStart = msgs[i]?.info?.time?.created;
+      if (msgs[i]?.type === "user") {
+        turnStart = msgs[i]?.time?.created;
         break;
       }
     }
     const last = msgs[msgs.length - 1];
-    const lastActivity = last?.info?.time?.completed ?? last?.info?.time?.created;
+    const lastActivity = last?.time?.completed ?? last?.time?.created;
     return { transcript: renderTranscript(msgs), turnStart, lastActivity };
   } catch {
     return { transcript: [] };
@@ -531,14 +598,25 @@ async function runCommand(cmd: Command): Promise<void> {
   const tag = `[${num !== undefined ? `#${num} ` : ""}${await sessionDirectory(target)}]`;
   try {
     if (cmd.kind === "stop") {
-      await fetch(`${BASE}/session/${target}/abort`, { method: "POST" });
+      await client().session.interrupt({ sessionID: target });
       await sendText(`已中断 ${tag}`);
       log("command: stop");
       return;
     }
 
+    // .btw asks a side question: it is answered from the session's context and
+    // is not added to the conversation, so it disturbs neither the running turn
+    // nor the transcript. It does cost one model call.
+    if (cmd.kind === "btw") {
+      const answer = (await client().session.generate({ sessionID: target, prompt: cmd.text })).text.trim();
+      const body = answer.length > 3500 ? `${answer.slice(0, 3500)}...` : answer;
+      await sendWithRetry(`**opencode · 旁问**\n\n\`${tag}\` ${cmd.text.slice(0, 80)}\n\n---\n\n${body}`);
+      log(`btw answered for ${target}: ${preview(cmd.text)}`);
+      return;
+    }
+
     if (cmd.kind === "ask") {
-      // .ask means "steer into the running turn"; prompt_async already does that.
+      // .ask means "steer into the running turn"; the default delivery does that.
       await prompt(target, cmd.text);
       await sendText(`已插话 ${tag}: ${cmd.text.slice(0, 80)}`);
       log(`ask steered into ${target}: ${preview(cmd.text)}`);
@@ -546,7 +624,7 @@ async function runCommand(cmd: Command): Promise<void> {
     }
 
     // .task means "when you finish, do this". If a turn is running, hold it and
-    // release on idle; otherwise there is nothing to wait for, send now.
+    // release on the turn end; otherwise there is nothing to wait for, send now.
     if (await sessionIsBusy(target)) {
       const n = taskQueue.push(target, cmd.text);
       await sendText(`已排队 ${tag}（本轮结束后执行，队列 ${n} 条）: ${cmd.text.slice(0, 80)}`);
@@ -557,45 +635,26 @@ async function runCommand(cmd: Command): Promise<void> {
     await sendText(`已发送 ${tag}: ${cmd.text.slice(0, 80)}`);
     log(`task sent now (idle) to ${target}: ${preview(cmd.text)}`);
   } catch (cause) {
-    await sendText(`.${cmd.kind} 失败: ${cause instanceof Error ? cause.message : cause}`);
+    const hint = cmd.kind === "btw" ? "（会话可能正忙，稍后再试或先 .status）" : "";
+    await sendText(`.${cmd.kind} 失败${hint}: ${cause instanceof Error ? cause.message : cause}`);
   }
 }
 
 /**
- * The route that actually delivers a message.
+ * Inject a message into a session.
  *
- * NOT `/api/session/{id}/prompt`: that v2 route looks canonical (returns an
- * `admittedSeq`) but is a no-op - measured, an admitted prompt never appears in
- * the session even while a turn is running. `prompt_async` delivers and starts
- * the session if idle. Exported so the choice is locked by a test.
- */
-export function promptPath(sessionID: string): string {
-  return `/session/${sessionID}/prompt_async`;
-}
-
-/**
- * Inject a message into a session via `promptPath`.
+ * The bridge queues `.task` itself (see `drainQueue`) and only sends once the
+ * turn is over, so the default delivery is right for both `.task` and `.ask`.
  *
- * The session's own agent is passed explicitly. opencode would otherwise fall
- * back to the last user message's agent (or the default "build"), which means a
- * `.task` into a "yolo" session could suddenly start asking for permissions.
- * Reusing the session's agent keeps the run in the mode you were already in.
+ * The agent is not passed: unlike V1, a session keeps its own agent (it is a
+ * session property, changed with `switchAgent`), so a `.task` into a "yolo"
+ * session stays in that mode.
+ *
+ * NOTE: unverified against a live session - delivery is the one V2 behaviour
+ * this bridge does not exercise yet.
  */
 async function prompt(sessionID: string, text: string): Promise<void> {
-  const agent = (await sessionInfo(sessionID)).agent;
-  const payload = { parts: [{ type: "text", text }], ...(agent ? { agent } : {}) };
-  const res = await fetch(`${BASE}${promptPath(sessionID)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (res.ok) return;
-  const fallback = await fetch(`${BASE}/session/${sessionID}/message`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!fallback.ok) throw new Error(`HTTP ${res.status} then ${fallback.status}`);
+  await client().session.prompt({ sessionID, text });
 }
 
 const CONFIRM: Record<Verdict, string> = {
@@ -630,10 +689,8 @@ async function sendWithRetry(content: string, attempts = 3): Promise<void> {
 async function reconcilePending(): Promise<void> {
   if (!pending.size) return;
   try {
-    const res = await fetch(`${BASE}/permission`);
-    if (!res.ok) return;
-    const list = (await res.json()) as Array<{ id?: string; requestID?: string }>;
-    const live = new Set(list.map((p) => p.id ?? p.requestID).filter((v): v is string => !!v));
+    const list = await client().permission.request.list({});
+    const live = new Set((list.data ?? []).map((p) => p.id).filter((v): v is string => !!v));
     for (const id of [...pending.keys()]) {
       if (!live.has(id)) {
         pending.delete(id);
@@ -697,12 +754,30 @@ export function formatPermission(
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
     lastEventAt = Date.now();
+    const type = event.type;
+    const data = event.data ?? {};
+
+    // Busy-ness is observed rather than asked for: a step starting means work is
+    // in flight, and a step that ends without wanting a tool call means the turn
+    // is over (V2 has no session.status / session.idle on the public stream).
+    if (type === "session.step.started") {
+      noteBusy(asString(data.sessionID), true);
+      return;
+    }
+    if (type === "session.step.ended") {
+      if (data.finish === "tool-calls") return;
+      const ended = asString(data.sessionID);
+      noteBusy(ended, false);
+      // Release any .task held for this session now that its turn is over.
+      if (ended) await drainQueue(ended);
+      return;
+    }
 
     // A permission resolved elsewhere (approved in the TUI, auto-allowed) must
     // leave the pending map, or a later QQ reply targets a dead request and 404s.
-    if (event.type === "permission.replied") {
-      const pid = event.properties?.permissionID;
-      if (typeof pid === "string" && pending.delete(pid)) {
+    if (type === "permission.replied") {
+      const pid = asString(data.requestID);
+      if (pid && pending.delete(pid)) {
         log(`permission ${pid} resolved elsewhere; dropped from pending`);
       }
       return;
@@ -714,39 +789,28 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     // Track the most recent session from ANY event, not just permissions:
     // `.stop` / `.task` need a target even when no permission has fired.
-    const anySessionID = event.properties?.sessionID;
-    if (typeof anySessionID === "string" && anySessionID) rememberSession(anySessionID);
+    const anySessionID = asString(data.sessionID);
+    if (anySessionID) rememberSession(anySessionID);
 
-    // Release any .task held for this session once its turn ends.
-    if (
-      event.type === "session.status" &&
-      typeof anySessionID === "string" &&
-      (event.properties?.status as { type?: string } | undefined)?.type === "idle"
-    ) {
-      await drainQueue(anySessionID);
-    }
-
-    if (event.type !== "permission.updated" && event.type !== "permission.asked") return;
-    const p = event.properties ?? {};
-    const requestID = typeof p.id === "string" ? p.id : undefined;
+    if (type !== "permission.asked") return;
+    const requestID = asString(data.id);
     if (!requestID || pending.has(requestID)) return;
 
-    const permission = typeof p.permission === "string" ? p.permission : "unknown";
-    const patterns = Array.isArray(p.patterns) ? p.patterns.map(String) : [];
-    const metadata = (p.metadata ?? {}) as Record<string, unknown>;
+    const permission = typeof data.action === "string" ? data.action : "unknown";
+    const patterns = Array.isArray(data.resources) ? data.resources.map(String) : [];
+    const metadata = (data.metadata ?? {}) as Record<string, unknown>;
 
     // The QQ push is the point, so the directory lookup must not be able to
     // throw past it (this is exactly how a subagent approval got dropped once).
-    const sessionID = typeof p.sessionID === "string" ? p.sessionID : "";
     let directory = "(unknown)";
     try {
-      if (sessionID) directory = await sessionDirectory(sessionID);
+      if (anySessionID) directory = await sessionDirectory(anySessionID);
     } catch {
       /* keep "(unknown)" */
     }
-    const num = sessionID ? rememberSession(sessionID) : undefined;
+    const num = anySessionID ? rememberSession(anySessionID) : undefined;
 
-    pending.set(requestID, { requestID, sessionID, permission });
+    pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
     await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num));
     log(`permission ${requestID} (${permission}) -> QQ`);
   } catch (cause) {
@@ -782,18 +846,23 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
       return;
     }
 
-    const res = await fetch(`${BASE}/session/${target.sessionID}/permissions/${target.requestID}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ response: reply }),
-    });
-    if (res.status === 404) {
+    try {
+      await client().permission.reply({
+        sessionID: target.sessionID,
+        requestID: target.requestID,
+        decision: reply,
+      });
+    } catch (cause) {
+      // A request answered elsewhere between the liveness check and the reply is
+      // gone for good: say so instead of reporting a hard failure.
+      const list = await client().permission.request.list({}).catch(() => null);
+      const stillLive = list?.data?.some((p) => p.id === target.requestID) ?? false;
+      if (stillLive) throw cause;
       pending.delete(target.requestID);
       await sendText(`该审批已失效（可能已在电脑上处理）· ${target.permission}`);
       log(`permission ${target.requestID} already resolved; reply skipped`);
       return;
     }
-    if (!res.ok) throw new Error(`reply failed: HTTP ${res.status}`);
 
     pending.delete(target.requestID);
     await sendText(`${CONFIRM[reply]} · ${target.permission}`);
@@ -807,7 +876,12 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
 // SSE subscription
 // ---------------------------------------------------------------------------
 
-/** Reconnect forever with capped backoff; a dropped stream is expected, not fatal. */
+/**
+ * Subscribe to the service's event stream, reconnecting forever.
+ *
+ * A dropped stream is expected, not fatal. The service is re-discovered on every
+ * attempt, because a restarted service comes back on a different port.
+ */
 async function subscribeEvents(
   onEvent: (event: OpencodeEvent) => void,
   signal: AbortSignal,
@@ -816,47 +890,23 @@ async function subscribeEvents(
   let announced = false;
   while (!signal.aborted) {
     try {
-      const res = await fetch(`${BASE}/event`, {
-        signal,
-        headers: { accept: "text/event-stream" },
-      });
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const connection = await connectClient();
       backoff = 1000;
       announced = false;
       log("subscribed to opencode events");
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let sep: number;
-        while ((sep = buffer.indexOf("\n\n")) !== -1) {
-          const frame = buffer.slice(0, sep);
-          buffer = buffer.slice(sep + 2);
-          for (const line of frame.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const raw = line.slice(5).trim();
-            if (!raw) continue;
-            try {
-              onEvent(JSON.parse(raw) as OpencodeEvent);
-            } catch {
-              log("dropped unparseable event frame");
-            }
-          }
-        }
+      for await (const event of connection.event.subscribe({ signal })) {
+        onEvent(event as OpencodeEvent);
       }
       throw new Error("stream ended");
     } catch (cause) {
       if (signal.aborted) return;
-      // Say it once, loudly, because the usual cause is "no opencode serve
-      // running at BASE" - which otherwise looks like the bridge doing nothing.
+      // Say it once, loudly: the usual cause is "no opencode service running",
+      // which otherwise looks like the bridge doing nothing.
       if (!announced) {
         announced = true;
-        log(`cannot reach opencode at ${BASE} - is "opencode serve" running?`);
-        log(`(remote approvals need serve + attach, not a plain "opencode")`);
+        log("cannot reach a local opencode service");
+        log("(start opencode once, or run `opencode service restart`)");
       }
       log(`event stream dropped (${cause instanceof Error ? cause.message : cause}); retry in ${backoff}ms`);
       await sleep(backoff);
@@ -871,7 +921,6 @@ async function subscribeEvents(
 
 async function check(): Promise<number> {
   console.log(`config: ${configPath()}`);
-  console.log(`opencode: ${BASE}`);
 
   const cfg = loadConfig();
   if (!cfg.qqbot) {
@@ -890,12 +939,13 @@ async function check(): Promise<number> {
   }
 
   try {
-    const res = await fetch(`${BASE}/permission`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const list = (await res.json()) as unknown[];
-    console.log(`  opencode server: OK (${list.length} pending)`);
+    const endpoint = await Service.discover();
+    if (!endpoint) throw new Error("no local service registered");
+    const connection = await connectClient();
+    const list = await connection.permission.request.list({});
+    console.log(`  opencode service: OK (${endpoint.url}, ${list.data?.length ?? 0} pending)`);
   } catch (cause) {
-    console.log(`  opencode server: FAILED - ${cause instanceof Error ? cause.message : cause}`);
+    console.log(`  opencode service: FAILED - ${cause instanceof Error ? cause.message : cause}`);
     return 1;
   }
   return 0;
@@ -908,11 +958,14 @@ function help(): number {
       "",
       "usage:",
       "  bun run src/bridge.ts            start the daemon",
-      "  bun run src/bridge.ts --check    verify config + token + server",
+      "  bun run src/bridge.ts --check    verify config + token + service",
       "  bun run src/bridge.ts --help",
       "",
+      "The opencode service is discovered automatically (url + password);",
+      "there is no fixed port and no manual `opencode serve` + attach.",
+      "",
       "env:",
-      "  OPENCODE_SERVER_URL   opencode server base (default http://127.0.0.1:4096)",
+      "  OPENCODE_NOTIFY_QQ_LOCK_PORT   single-instance lock port (default 4097)",
     ].join("\n"),
   );
   return 0;
