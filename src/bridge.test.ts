@@ -364,25 +364,31 @@ describe("asideRules", () => {
 });
 
 describe("formatList", () => {
-  test("one line per session, with the count in the header", () => {
+  test("title first, then state and directory", () => {
     const out = formatList([
       { num: 1, directory: "D:\\Desktop", state: "运行中", title: "插件迁移升级 → v2 适配" },
-      { num: 2, directory: "E:\\1\\2\\go-zero", state: "空闲（最后活动 12m 前）", title: "查看 patch" },
+      { num: 2, directory: "D:\\Desktop", state: "空闲（12m 前）", title: "View patch" },
     ]);
     const lines = out.split("\n");
-    expect(lines[0]).toBe("**opencode · 会话列表**（2）");
-    expect(lines[1]).toBe("#1 [D:\\Desktop] 运行中 · 插件迁移升级 → v2 适配");
-    expect(lines[2]).toBe("#2 [E:\\1\\2\\go-zero] 空闲（最后活动 12m 前） · 查看 patch");
+    expect(lines[0]).toBe("**opencode · 会话列表**（最近 2）");
+    expect(lines[1]).toBe("#1 插件迁移升级 → v2 适配 · 运行中 · `D:\\Desktop`");
+    expect(lines[2]).toBe("#2 View patch · 空闲（12m 前） · `D:\\Desktop`");
+  });
+
+  test("a session without a title falls back to its directory", () => {
+    expect(formatList([{ num: 3, directory: "E:\\repo", state: "空闲" }]).split("\n")[1]).toBe(
+      "#3 E:\\repo · 空闲 · `E:\\repo`",
+    );
   });
 
   test("caps the rows and says how many there are", () => {
     const rows = Array.from({ length: 5 }, (_, i) => ({ num: i + 1, directory: "d", state: "空闲" }));
     const out = formatList(rows, 2).split("\n");
-    expect(out[0]).toBe("**opencode · 会话列表**（2 / 共 5）");
+    expect(out[0]).toBe("**opencode · 会话列表**（最近 2 / 共 5）");
     expect(out).toHaveLength(3);
   });
 
-  test("says so when nothing is numbered yet", () => {
-    expect(formatList([])).toContain("还没有编号过的会话");
+  test("says so when there is nothing to list", () => {
+    expect(formatList([])).toContain("还没有见过会话");
   });
 });

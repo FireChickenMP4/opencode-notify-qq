@@ -697,13 +697,15 @@ export type ListRow = { num: number; directory: string; state: string; title?: s
  */
 export function formatList(rows: ListRow[], max = 8): string {
   if (!rows.length) {
-    return "还没有编号过的会话；等 opencode 报一个事件（或发一条 `.status`）之后再看。";
+    return "这台机器上还没有见过会话；等 opencode 报一个事件（或发一条 `.status`）之后再看。";
   }
   const shown = rows.slice(0, max);
-  const head = `**opencode · 会话列表**（${shown.length}${rows.length > shown.length ? ` / 共 ${rows.length}` : ""}）`;
+  const head = `**opencode · 会话列表**（最近 ${shown.length}${rows.length > shown.length ? ` / 共 ${rows.length}` : ""}）`;
   const lines = shown.map((row) => {
-    const title = row.title ? ` · ${row.title.slice(0, 40)}` : "";
-    return `#${row.num} [${row.directory}] ${row.state}${title}`;
+    // Title first: several sessions can share one directory, so the directory
+    // alone does not tell them apart.
+    const name = row.title ? row.title.slice(0, 40) : row.directory;
+    return `#${row.num} ${name} · ${row.state} · \`${row.directory}\``;
   });
   return [head, ...lines].join("\n");
 }
@@ -765,25 +767,26 @@ export function formatStatus(input: {
 }
 
 /** Gather live state and reply with it. */
-/** Reply to `.list`: the sessions this bridge can address, most recent first. */
+/** Reply to `.list`: the sessions you can address, most recent first. */
 async function sendList(): Promise<void> {
   const rows = (await allSessions())
     .filter((s) => !s.parentID && !isAsideSession(s))
-    .map((s) => ({ s, num: sessionNumbers.lookup(s.id) }))
-    .filter((row): row is { s: Session; num: number } => row.num !== undefined)
-    .sort((a, b) => (b.s.time?.updated ?? 0) - (a.s.time?.updated ?? 0))
+    .sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
+    .slice(0, LIST_LINES)
     .map(
-      ({ s, num }): ListRow => ({
-        num,
+      (s): ListRow => ({
+        // Listing is how you address them, so hand out numbers here: whatever
+        // the list shows can be named in the next command.
+        num: sessionNumbers.numberFor(s.id),
         directory: s.directory ?? "?",
         state: busySessions.has(s.id)
           ? "运行中"
-          : `空闲（最后活动 ${fmtAgo(s.time?.updated ? Date.now() - s.time.updated : null)}）`,
+          : `空闲（${fmtAgo(s.time?.updated ? Date.now() - s.time.updated : null)}）`,
         title: s.title,
       }),
     );
   await sendText(formatList(rows, LIST_LINES));
-  log(`command: list (${rows.length} numbered)`);
+  log(`command: list (${rows.length} shown)`);
 }
 
 async function sendStatus(target?: number): Promise<void> {
