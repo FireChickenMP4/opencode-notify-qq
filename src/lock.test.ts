@@ -7,7 +7,13 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-let listeners: Array<ReturnType<typeof Bun.listen>> = [];
+/**
+ * Only `stop` is used; `ReturnType<typeof Bun.listen>` would pick the Unix
+ * overload (`Bun.listen` is overloaded for TCP and Unix sockets).
+ */
+type Listener = { stop(closeActiveConnections?: boolean): void };
+
+let listeners: Listener[] = [];
 
 afterEach(() => {
   for (const l of listeners) l.stop(true);
@@ -16,7 +22,7 @@ afterEach(() => {
 
 function bind(port: number): boolean {
   try {
-    listeners.push(Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } }));
+    listeners.push(Bun.listen<undefined>({ hostname: "127.0.0.1", port, socket: { data() {} } }));
     return true;
   } catch {
     return false;

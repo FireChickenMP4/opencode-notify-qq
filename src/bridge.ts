@@ -982,9 +982,14 @@ async function run(): Promise<number> {
   // a second connection kicks the first (op 9). A bound TCP port is the lock:
   // the OS guarantees uniqueness and releases it when the process dies, so
   // there are no stale PID files to reason about.
-  let lock: ReturnType<typeof Bun.listen> | null = null;
+  //
+  // The listener type is written structurally (only `stop` is used) because
+  // `Bun.listen` is overloaded for TCP and Unix sockets and `ReturnType` of an
+  // overloaded function picks the wrong one.
+  type LockListener = { stop(closeActiveConnections?: boolean): void };
+  let lock: LockListener | null = null;
   try {
-    lock = Bun.listen({ hostname: "127.0.0.1", port: LOCK_PORT, socket: { data() {} } });
+    lock = Bun.listen<undefined>({ hostname: "127.0.0.1", port: LOCK_PORT, socket: { data() {} } });
   } catch {
     console.error(`another bridge is already running (port ${LOCK_PORT} is in use).`);
     console.error(`stop it first, or set OPENCODE_NOTIFY_QQ_LOCK_PORT to a free port.`);
