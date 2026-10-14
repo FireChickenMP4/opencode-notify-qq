@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript } from "../src/bridge";
+import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -274,5 +274,40 @@ describe("lastAssistantText", () => {
       { type: "assistant", content: [{ type: "tool", name: "read" }] },
     ];
     expect(lastAssistantText(msgs, 1)).toBe("");
+  });
+});
+
+describe("turnEnded", () => {
+  const A = (finish?: string, completed = true) => ({ type: "assistant", finish, time: completed ? { completed: 1 } : {} });
+  const tool = () => ({ type: "assistant", finish: "tool-calls", time: { completed: 1 } });
+  const idle = () => ({ type: "idle" });
+
+  test("an idle marker ends the turn", () => {
+    expect(turnEnded([A("stop"), idle()])).toBe(true);
+  });
+
+  test("a terminal finish ends it before the marker is written", () => {
+    expect(turnEnded([tool(), A("stop")])).toBe(true);
+  });
+
+  test("a tool round is not the end", () => {
+    expect(turnEnded([tool()])).toBe(false);
+  });
+
+  test("nothing happened yet", () => {
+    expect(turnEnded([])).toBe(false);
+    expect(turnEnded([idle()])).toBe(false);
+  });
+});
+
+describe("isAsideSession", () => {
+  test("marked by the bridge, or titled", () => {
+    expect(isAsideSession({ metadata: { aside: true } })).toBe(true);
+    expect(isAsideSession({ title: "旁问 · 为什么构建挂了" })).toBe(true);
+  });
+
+  test("an ordinary session is not an aside", () => {
+    expect(isAsideSession({ title: "插件迁移升级 → v2 适配" })).toBe(false);
+    expect(isAsideSession({})).toBe(false);
   });
 });

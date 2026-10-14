@@ -106,7 +106,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 
 type OpencodeEvent = { id?: string; type?: string; data?: Record<string, unknown> };
-type Session = { id: string; directory?: string; agent?: string; parentID?: string };
+type Session = {
+  id: string;
+  directory?: string;
+  agent?: string;
+  parentID?: string;
+  title?: string;
+  metadata?: { aside?: boolean };
+};
 
 let sessions: Session[] | null = null;
 let sessionsAt = 0;
@@ -312,7 +319,7 @@ const draining = new Set<string>();
 function rememberSession(sessionID: string): number | undefined {
   // Our own aside fork: keep it out of the numbering and hand every untagged
   // command back to the session the user actually means.
-  if (asideIds.has(sessionID)) return undefined;
+  if (asideIds.has(sessionID) || asideSeen.has(sessionID)) return undefined;
   lastSessionID = sessionID;
   if (subagentIds.has(sessionID)) return undefined;
   return sessionNumbers.numberFor(sessionID);
@@ -320,6 +327,18 @@ function rememberSession(sessionID: string): number | undefined {
 
 /** Sessions known to be subagents (have a parentID). */
 const subagentIds = new Set<string>();
+
+/**
+ * Asides seen in the session list. A fork carries no parentID, so the list is
+ * the only way to recognise one after a bridge restart - which would otherwise
+ * let a running aside take a number and become the default target.
+ */
+const asideSeen = new Set<string>();
+
+/** True for a `.bt` aside fork, marked by this bridge (title is the fallback). */
+export function isAsideSession(session: { title?: string; metadata?: { aside?: boolean } }): boolean {
+  return session.metadata?.aside === true || Boolean(session.title?.startsWith("旁问 ·"));
+}
 
 /**
  * Forks this process created for `.bt`. Unlike a subagent, a fork carries no
@@ -352,9 +371,15 @@ async function refreshSessionRegistry(): Promise<void> {
   if (!list.length) return; // fetch failed; never wipe numbers on empty data
 
   subagentIds.clear();
+  asideSeen.clear();
   const main = list.filter((s) => {
     if (s.parentID) {
       subagentIds.add(s.id);
+      return false;
+    }
+    // An aside of ours is not the user's session: no number, never the default.
+    if (isAsideSession(s)) {
+      asideSeen.add(s.id);
       return false;
     }
     return true;
@@ -374,7 +399,7 @@ async function refreshSessionRegistry(): Promise<void> {
  * aborting one is never what you meant.
  */
 async function mostRecentSession(): Promise<string | null> {
-  const main = (await allSessions()).filter((s) => !s.parentID);
+  const main = (await allSessions()).filter((s) => !s.parentID && !isAsideSession(s));
   const sorted = [...main].sort(
     (a, b) =>
       ((b as { time?: { updated?: number } }).time?.updated ?? 0) -
@@ -574,25 +599,31 @@ export function lastAssistantText(msgs: Msg[], from: number): string {
 }
 
 /**
- * Wait for the forked session to finish a turn.
+ * True when the forked turn is over.
  *
- * A turn ends with an `idle` message (`outcome: succeeded|failed`); the answer
- * itself is the assistant message just before it. Checking for a terminal
- * `finish` as well covers the moment before that marker is written. Polling the
- * transcript keeps this off the event bookkeeping, which only tracks sessions we
- * are told about.
+ * A turn ends with an `idle` marker (`outcome: succeeded|failed`); the answer
+ * itself is the assistant message just before it. The terminal-finish check
+ * covers the moment before that marker is written. Pure, so the rule is testable.
+ */
+export function turnEnded(tail: Msg[]): boolean {
+  if (!tail.some((m) => m.type === "assistant")) return false;
+  if (tail.some((m) => m.type === "idle")) return true;
+  return tail.some(
+    (m) => m.type === "assistant" && Boolean(m.finish) && m.finish !== "tool-calls" && Boolean(m.time?.completed),
+  );
+}
+
+/**
+ * Poll the fork's transcript until its turn is over. Reading the transcript
+ * keeps this off the event bookkeeping, which only tracks sessions we are told
+ * about.
  */
 async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(700);
     const msgs = await sessionMessages(sessionID).catch(() => [] as Msg[]);
-    const tail = msgs.slice(baseline);
-    if (!tail.some((m) => m.type === "assistant")) continue;
-    if (tail.some((m) => m.type === "idle")) return true;
-    if (tail.some((m) => m.type === "assistant" && m.finish && m.finish !== "tool-calls" && m.time?.completed)) {
-      return true;
-    }
+    if (turnEnded(msgs.slice(baseline))) return true;
   }
   return false;
 }

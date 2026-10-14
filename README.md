@@ -236,8 +236,9 @@ QQ 发以 `.` 开头的消息：
 > （`.btw` / `.bt` 是即时问答，由 bridge 直接回复，不需要标记；`.bt` 的回复开头会带你问的
 > 那个会话的编号 `#N`，因为 aside 本身是临时 fork、不留编号。）
 >
-> **`.bt` 期间 win / email 仍会响一次**：aside 是 fork，没有 `parentID`，而这两个插件只按
-> `parentID` 判子代理，所以它会多弹一次 toast / 多发一封邮件（QQ 这边已按 aside 标记静默）。
+> **`.bt` 不会额外打扰其它插件**：aside 是 fork、没有 `parentID`，所以 win / email / QQ
+> 三个插件都另外认 bridge 打在它身上的 aside 标记（`metadata {aside:true}` 或标题前缀
+> 「旁问 &#183;」），不会为它推「完成」。
 >
 > 同理，「agent 提问」（`question` 工具）也是**需要你回应**的，所以同样**不受开关管**：
 > bridge 会把题目与选项推给你，回 `.answer <内容>` 即可（可写选项文字，也可写自由文本；
