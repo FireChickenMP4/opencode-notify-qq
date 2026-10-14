@@ -345,3 +345,26 @@ fork 抢走了会话编号（`.status` 显示成了 `#3`，`.ask #3` 真的打�
 4. 能力边界按命令分（`.btw` 没有工具 / `.bt` 在只读分支里 —— 做不到就一句话请用户改用 `.ask`）。
 
 `asideFraming()` 也抽成可测的纯函数（`extra` 参数注入用户的 `asidePrompt`），补了 4 个测试。
+
+
+### .bt 的能力上限与「guarded」档（真机反馈）
+
+真机跑通后发现一个更根本的限制：**fork 继承的是会话的 agent**，而 agent 的工具集是硬上限 ——
+如果该会话用的 agent 只有 Code Mode/MCP 那几件（没有 read/grep/shell），那么旁问再怎么写规则
+也只能凭已知信息回答。只读/放开的规则只是「上限之内再收紧」，加不出工具来。
+
+所以：
+
+- 新增 `asideAgent`（默认 `"build"`）：fork 出来后 `session.switchAgent()` 换到自带完整工具集的
+  agent；写 `"inherit"` 则沿用会话自己的（换不上时记日志、不失败）。
+- `asideTools` 从两档变三档：`readonly`（只读）/ **`guarded`（新默认）** / `full`。
+  guarded = 读文件与搜索直接放行；`edit` 一律 `ask`，但**沙盒目录**（`%TEMP%/opencode/aside/<fork>`）
+  内的写在规则表里靠后、最后匹配生效，所以那里不用审批；`shell` 一律 `ask`。
+  也就是「批个 tmp 目录随便试，动工作区或跑命令就弹审批推到手机」——约束交给 opencode 自己的
+  审批流，而不是一刀切禁掉。
+- 框架提示词同时告诉它沙盒路径，以及「改别处/跑命令会弹审批，能不动就不动」。
+- 沙盒目录在 fork 删除时一并清理（尽力而为：句柄占用时留着）。
+- 测试：`asideRules` 三档各 1 例、`asideAgent` 解析 1 例、`asideFraming` 沙盒 1 例。
+
+尚未做（下一步可选项）：把 aside 放进 **worktree** 以获得真正的「可回溯」（改动落在副本里，
+用完连 worktree 一起删）。现在 guarded 档靠审批兜底，改动是真的。

@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { asideFraming, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
+import { asideFraming, asideRules, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -332,6 +332,34 @@ describe("asideFraming", () => {
 
   test("no extra text leaves no dangling blank line", () => {
     expect(asideFraming("btw", "").endsWith("\n")).toBe(false);
+  });
+
+  test("the bt side names its sandbox", () => {
+    expect(asideFraming("bt", "", "C:\\Temp\\aside\\ses_x")).toContain("C:\\Temp\\aside\\ses_x");
+  });
+});
+
+describe("asideRules", () => {
+  const sandbox = "C:\\Users\\me\\AppData\\Local\\Temp\\opencode\\aside\\ses_x";
+  const find = (mode: "readonly" | "guarded" | "full", action: string, resource: string) =>
+    asideRules(mode, sandbox).find((r) => r.action === action && r.resource === resource)?.effect;
+
+  test("readonly stops at reading", () => {
+    expect(find("readonly", "read", "*")).toBe("allow");
+    expect(find("readonly", "edit", "*")).toBe("deny");
+    expect(find("readonly", "shell", "*")).toBe("deny");
+  });
+
+  test("guarded asks outside the sandbox, allows inside it", () => {
+    expect(find("guarded", "edit", "*")).toBe("ask");
+    expect(find("guarded", "shell", "*")).toBe("ask");
+    expect(find("guarded", "read", "*")).toBe("allow");
+    // The sandbox rule is listed last, so it wins for paths under it.
+    expect(find("guarded", "edit", "C:/Users/me/AppData/Local/Temp/opencode/aside/ses_x/*")).toBe("allow");
+  });
+
+  test("full adds no rules of its own", () => {
+    expect(asideRules("full", sandbox)).toHaveLength(0);
   });
 });
 

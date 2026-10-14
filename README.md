@@ -45,7 +45,8 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
   "awayNotify": {
     "enabled": false
   },
-  "asideTools": "readonly"
+  "asideTools": "guarded",
+  "asideAgent": "build"
 }
 ```
 
@@ -56,7 +57,8 @@ opencode 自带的通知依赖终端转义序列，**在 Windows Terminal 上不
 | `notifyTarget.type` | `c2c`（单聊）或 `group`（群聊） |
 | `notifyTarget.openid` | `c2c` 用；`group` 时改用 `groupOpenid` |
 | `awayNotify.enabled` | 回合结束时**自动**推 QQ。**默认 false** |
-| `asideTools` | `.bt` 旁问能用哪些工具：`"readonly"`（默认，只读）/ `"full"`（和普通回合一样）。每次调用时读，改完即生效 |
+| `asideTools` | `.bt` 旁问的权限档位：`"guarded"`（**默认**：改工作区文件、执行命令都弹审批 → 推到 QQ；沙盒目录里的改动不用审批）/ `"readonly"`（只读，不能写、不能跑）/ `"full"`（和普通回合一样）。每次调用时读 |
+| `asideAgent` | `.bt` 旁问用哪个 agent。**默认 `"build"`**（opencode 自带的编码 agent，工具集完整）；`"inherit"` 沿用会话自己的 agent —— 注意 agent 的工具集是硬上限：如果它会话的 agent 没有 read/shell，旁问就只能凭已知信息回答 |
 | `asidePrompt` | 追加到 `.btw` / `.bt` 提示词末尾的自定义要求（例如「回答用中文，先给结论」）。**默认空**，每次调用时读 |
 
 > 这个文件含密钥，**永远不要提交**。它不在任何仓库里。
@@ -221,7 +223,7 @@ QQ 发以 `.` 开头的消息：
 | `.task <内容>` | 派任务，**排队到本轮结束**（bridge 自己排队，回合结束才送出） |
 | `.ask <内容>` | 立即插话进正在跑的回合；会话空闲时与 `.task` 等效 |
 | `.btw <问题>` | **旁问**：用会话上下文一次性回答，不进对话、不打断回合。先回一条「已发出」再回答案；**用不了工具**（opencode 的 generate 就是这么定的），所以需要读文件/查网页的问题会答不出或答不全 —— 那类用 `.ask` / `.task` |
-| `.bt <问题>` | **带工具的旁问**：把问题丢进这个会话的**临时分支**（fork）里跑一轮，所以它**既懂上下文、又真能用工具**（读文件、查网页），答完就把分支删掉，主会话的记录与正在跑的回合都不受影响。默认**只读**（read/glob/grep/webfetch/websearch），不给写盘与 shell；想让它能动手，在配置里写 `"asideTools": "full"`。先回一条「已发出」再回答案 |
+| `.bt <问题>` | **带工具的旁问**：把问题丢进这个会话的**临时分支**（fork）里跑一轮（并换用 `build` agent，工具集完整），答完就把分支删掉，主会话的记录与正在跑的回合都不受影响。默认档位 `guarded`：读文件、搜索随便用；**改工作区文件、执行命令都会弹审批推到 QQ**；沙盒目录里的实验不用审批。先回一条「已发出」再回答案 |
 | `.list` | 列出这个 bridge 能寻址的会话：编号 + 目录 + 运行中/空闲 + 标题，按最近活动排序。默认最多 8 条（`OPENCODE_NOTIFY_QQ_LIST_LINES`）；只显示已经有编号的会话 |
 | `.answer <内容>` | **回答** agent 的提问（`question` 工具）；没有待回答的问题时视为无效 |
 | `.stop` | 中断当前执行，最高优先级 |

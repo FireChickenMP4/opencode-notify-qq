@@ -69,10 +69,19 @@ describe("setAwayNotify", () => {
 });
 
 describe("asideTools parsing", () => {
-  test("read-only unless the file asks for full", () => {
-    expect(loadConfig(temp(JSON.stringify(creds))).asideTools).toBe("readonly");
+  test("guarded by default, readonly or full on request", () => {
+    expect(loadConfig(temp(JSON.stringify(creds))).asideTools).toBe("guarded");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "readonly" }))).asideTools).toBe("readonly");
     expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "full" }))).asideTools).toBe("full");
-    expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "nonsense" }))).asideTools).toBe("readonly");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "nonsense" }))).asideTools).toBe("guarded");
+  });
+});
+
+describe("asideAgent parsing", () => {
+  test("build by default, inherit or a name on request", () => {
+    expect(loadConfig(temp(JSON.stringify(creds))).asideAgent).toBe("build");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideAgent: " inherit " }))).asideAgent).toBe("inherit");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideAgent: "" }))).asideAgent).toBe("build");
   });
 });
 

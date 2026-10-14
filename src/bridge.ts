@@ -19,7 +19,9 @@
  *   bun run src/bridge.ts --help
  */
 
-import { writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { OpenCode } from "@opencode/client/promise";
 import { headers, Service } from "@opencode/client/service";
 import { markCommandOutcome } from "./command-outcome";
@@ -634,20 +636,35 @@ async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: nu
 }
 
 /**
- * Permission rules for `.bt`. Read-only by default: the answer may read files
- * and search the web, but nothing that writes or runs a command. Setting
- * `asideTools` to "full" in the config file drops the restriction entirely.
+ * Permission rules for `.bt`, by mode.
+ *
+ * "guarded" deliberately leaves the broad rules in place and adds the sandbox
+ * exception last (the last matching rule wins): a write inside the fork's own
+ * sandbox is free, anything else asks. Pure, so the set is testable.
  */
-function asidePermissions(): { action: string; resource: string; effect: "allow" | "deny" }[] {
-  if (loadConfig().asideTools === "full") return [];
+export function asideRules(
+  mode: "readonly" | "guarded" | "full",
+  sandbox: string,
+): { action: string; resource: string; effect: "allow" | "deny" | "ask" }[] {
+  if (mode === "full") return [];
+  const read = (["read", "glob", "grep", "webfetch", "websearch"] as const).map((action) => ({
+    action,
+    resource: "*",
+    effect: "allow" as const,
+  }));
+  if (mode === "readonly") {
+    return [
+      ...read,
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "shell", resource: "*", effect: "deny" },
+    ];
+  }
   return [
-    { action: "read", resource: "*", effect: "allow" },
-    { action: "glob", resource: "*", effect: "allow" },
-    { action: "grep", resource: "*", effect: "allow" },
-    { action: "webfetch", resource: "*", effect: "allow" },
-    { action: "websearch", resource: "*", effect: "allow" },
-    { action: "edit", resource: "*", effect: "deny" },
-    { action: "shell", resource: "*", effect: "deny" },
+    ...read,
+    { action: "edit", resource: "*", effect: "ask" },
+    // Rules match normalized paths (slashes, case-insensitive on Windows).
+    { action: "edit", resource: `${sandbox.replace(/\\/g, "/")}/*`, effect: "allow" },
+    { action: "shell", resource: "*", effect: "ask" },
   ];
 }
 
@@ -691,12 +708,17 @@ export function formatList(rows: ListRow[], max = 8): string {
   return [head, ...lines].join("\n");
 }
 
+/** Scratch directory for a `.bt` fork: writes here need no approval. */
+function asideSandbox(forkID: string): string {
+  return join(tmpdir(), "opencode", "aside", forkID);
+}
+
 /**
  * The framing every `.btw` / `.bt` prompt carries: those answers are read on a
  * phone, come from a throwaway context, and are not a work order. The user's own
  * words (`asidePrompt` in the config file) go last, so they win.
  */
-export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePrompt): string {
+export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePrompt, sandbox?: string): string {
   const shared = [
     "【QQ 旁问】用户不在电脑前，你这段回答会作为一条 QQ 消息直接推到他手机上。请照这个来写：",
     "1. 先给结论，再给必要的依据；手机屏幕小，能短就短，不要贴大段代码或长表格；",
@@ -706,7 +728,15 @@ export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePromp
   const tools =
     kind === "btw"
       ? "另外：你没有工具可用 —— 如果回答需要读文件、查网页或跑命令，就用一句话说明「这要看代码/跑一下，请用 .ask 问我」，不要猜、不要编。"
-      : "另外：你在一份用完即弃的临时分支里（主会话不受影响），可以读文件、搜索、查资料，但不能改文件或执行命令 —— 如果回答必须动手才能给出，就用一句话说明「这要动手改/跑一下，请用 .ask 问我」。";
+      : [
+          "另外：你在一份用完即弃的临时分支里（主会话不受影响），可以读文件、搜索、查资料。",
+          sandbox
+            ? `想做实验就写进沙盒目录 ${sandbox}（那里的改动不用审批）；改工作区里的文件、或执行命令，都会弹审批推到用户手机上，所以能不动就不动，必须动就用一句话说明理由。`
+            : "",
+          "如果回答必须动手改或跑才能给出，就用一句话请他改用 .ask 问我。",
+        ]
+          .filter(Boolean)
+          .join("\n");
   return [shared, tools, ...(extra ? [extra] : [])].join("\n");
 }
 
@@ -798,7 +828,24 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     // like a session of its own, and the metadata is what the plugin reads to
     // stay quiet about it.
     asideIds.add(forkID);
-    const rules = asidePermissions();
+
+    const config = loadConfig();
+    const sandbox = asideSandbox(forkID);
+    mkdirSync(sandbox, { recursive: true });
+
+    // A fork inherits the session's agent, whose toolset may have no file access
+    // at all - the aside would then be unable to read anything. Switch it to a
+    // known-good agent unless the config says to inherit.
+    if (config.asideAgent !== "inherit") {
+      try {
+        await client().session.switchAgent({ sessionID: forkID, agent: config.asideAgent });
+      } catch (cause) {
+        const why = cause instanceof Error ? cause.message : String(cause);
+        log(`aside agent switch to ${config.asideAgent} failed: ${why}`);
+      }
+    }
+
+    const rules = asideRules(config.asideTools, sandbox);
     await client().session.update({
       sessionID: forkID,
       title: `旁问 · ${question.slice(0, 40)}`,
@@ -807,7 +854,10 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     });
 
     const baseline = (await sessionMessages(forkID)).length;
-    await client().session.prompt({ sessionID: forkID, text: `${asideFraming("bt")}\n\n${question}` });
+    await client().session.prompt({
+      sessionID: forkID,
+      text: `${asideFraming("bt", config.asidePrompt, sandbox)}\n\n${question}`,
+    });
     const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
     const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();
     const body = answer
@@ -831,6 +881,11 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     if (forkID) {
       asideIds.delete(forkID);
       await client().session.remove({ sessionID: forkID }).catch(() => {});
+      try {
+        rmSync(asideSandbox(forkID), { recursive: true, force: true });
+      } catch {
+        /* a handle may still hold the directory; leaving it is harmless */
+      }
     }
   }
 }

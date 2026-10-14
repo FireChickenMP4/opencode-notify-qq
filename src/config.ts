@@ -54,13 +54,22 @@ export type NotifyConfig = {
    */
   awayNotify: boolean;
   /**
-   * Tools available to `.bt`, the side question that may use them.
+   * What a `.bt` fork may do.
    *
-   * "readonly" (default) lets it read files and search the web, and denies
-   * everything that writes or runs a command. "full" gives the forked session
-   * whatever permissions a normal turn has.
+   *   "readonly"  read files and search, nothing else
+   *   "guarded"   (default) anything, but a write outside its own sandbox or any
+   *               command asks - the approval is pushed to QQ, so you stay in
+   *               control without a blanket ban
+   *   "full"      whatever a normal turn may do
    */
-  asideTools: "readonly" | "full";
+  asideTools: "readonly" | "guarded" | "full";
+  /**
+   * Agent the `.bt` fork runs as. A fork otherwise inherits the session's agent,
+   * whose toolset may have no file access at all (then the aside can only answer
+   * from what it already knows). "build" is the shipped coding agent; "inherit"
+   * keeps the session's own.
+   */
+  asideAgent: string;
   /**
    * Extra words appended to every `.btw` / `.bt` prompt: your house style for
    * those answers (language, shape, what to skip). Empty means none.
@@ -140,7 +149,9 @@ export function loadConfig(path = configPath()): NotifyConfig {
   return {
     ...(qqbot ? { qqbot } : {}),
     awayNotify,
-    asideTools: raw.asideTools === "full" ? "full" : "readonly",
+    asideTools:
+      raw.asideTools === "full" ? "full" : raw.asideTools === "readonly" ? "readonly" : "guarded",
+    asideAgent: typeof raw.asideAgent === "string" && raw.asideAgent.trim() ? raw.asideAgent.trim() : "build",
     asidePrompt: typeof raw.asidePrompt === "string" ? raw.asidePrompt.trim() : "",
   };
 }
