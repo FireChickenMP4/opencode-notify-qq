@@ -752,19 +752,28 @@ function asideSandbox(forkID: string): string {
 }
 
 /**
- * The framing every `.btw` / `.bt` prompt carries: those answers are read on a
- * phone, come from a throwaway context, and are not a work order. The user's own
- * words (`asidePrompt` in the config file) go last, so they win.
+ * The framing every `.btw` / `.bt` prompt carries: those answers come from a
+ * throwaway context and are not a work order. The user's own words (`asidePrompt`
+ * in the config file) go last, so they win. The `channel` decides which opening
+ * line is true, since a TUI aside is not read on a phone.
  */
 export function asideFraming(
   kind: "btw" | "bt",
   extra = loadConfig().asidePrompt,
   sandbox?: string,
   mode: "readonly" | "guarded" | "full" = loadConfig().asideTools,
+  channel: "qq" | "tui" = "qq",
 ): string {
+  // Say where the answer goes: the QQ copy is read on a phone, the TUI one on the
+  // screen the user is already looking at.
+  const opening =
+    channel === "qq"
+      ? "【QQ 旁问】用户不在电脑前，这段回答会作为一条 QQ 消息推到他手机上。"
+      : "【旁问】用户就坐在电脑前，让你用一次性分支先查清楚再回答。";
   const shared = [
-    "【QQ 旁问】用户不在电脑前，这段回答会作为一条 QQ 消息推到他手机上。",
-    "先给结论、能短就短（手机屏小，别贴大段代码或长表格）；不要复述问题、不要汇报过程、不要给「下一步计划」或反问要不要继续；也不要为了回答去改文件、跑命令或做实验 —— 需要动手时他会用 .ask / .task。用中文，别堆术语。",
+    opening,
+    "先给结论、能短就短；不要复述问题、不要汇报过程、不要给「下一步计划」或反问要不要继续；也不要为了回答去改文件、跑命令或做实验 —— 需要动手时他会用 .ask / .task。用中文，别堆术语。",
+    "如果问题含糊、或根本没有具体问题（例如只发来「测试」两个字），就用一句话反问他想问什么 —— 千万不要把上面这段说明当成答案复述回去。",
   ].join("\n");
   // The wording has to follow the permission mode: promising approvals under
   // "full" (where nothing asks) would be plainly wrong.
@@ -921,6 +930,7 @@ async function runAsideCore(
   question: string,
   onReady?: (info: { forkID: string; forkNum?: number; agent: string; agentError?: string }) => Promise<void> | void,
   keep = false,
+  channel: "qq" | "tui" = "qq",
 ): Promise<AsideRun> {
   let forkID: string | undefined;
   let forkNum: number | undefined;
@@ -964,7 +974,9 @@ async function runAsideCore(
     const baseline = (await sessionMessages(forkID)).length;
     await client().session.prompt({
       sessionID: forkID,
-      text: `${asideFraming("bt", config.asidePrompt, sandbox, config.asideTools)}\n\n${question}`,
+      // The question is labelled: a bare two-character question next to a wall of
+      // instructions is how the model ended up echoing the instructions.
+      text: `${asideFraming("bt", config.asidePrompt, sandbox, config.asideTools, channel)}\n\n要回答的问题：\n${question}`,
     });
     const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
     const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();
@@ -1007,7 +1019,7 @@ async function runAside(
   num: number | undefined,
   tag: string,
   question: string,
-  options: { push?: boolean; keep?: boolean } = {},
+  options: { push?: boolean; keep?: boolean; channel?: "qq" | "tui" } = {},
 ): Promise<AsideRun> {
   const push = options.push !== false;
   const run = await runAsideCore(
@@ -1023,6 +1035,7 @@ async function runAside(
       await sendText(`旁问(工具)已发出：分支 #${forkNum} · ${who} · 问 ${tag}，跑完回你：${question.slice(0, 80)}`);
     },
     options.keep === true,
+    options.channel ?? "qq",
   );
   if (run.error) {
     if (push) await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
@@ -1043,6 +1056,23 @@ async function runAside(
 /** The last branch a TUI `/bt` kept for reading; the next one replaces it. */
 let lastKeptAside: string | undefined;
 
+type AsideJob = { state: "running" | "done"; answer?: string; error?: string; branch?: number; forkID?: string };
+
+/**
+ * Jobs the TUI polls.
+ *
+ * Holding one HTTP request open until a tool-using aside finishes does not work:
+ * Bun closes an idle connection long before that. The CLI plugin starts a job and
+ * asks for its state every couple of seconds instead.
+ */
+const asideJobs = new Map<string, AsideJob>();
+/** How long a finished job stays readable (the plugin polls every 2s). */
+const ASIDE_JOB_TTL_MS = 30 * 60_000;
+
+function newJobID(): string {
+  return `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /**
  * `/bt` from the TUI: run it, keep the branch, and let the CLI plugin navigate to
  * it - a real session view renders markdown and scrolls, which a plugin dialog
@@ -1060,6 +1090,7 @@ async function runAsideTui(sessionID: string, question: string): Promise<AsideRu
   const run = await runAside(sessionID, num, tag, question, {
     push: loadConfig().awayNotify,
     keep: true,
+    channel: "tui",
   });
   // Keep at most one branch around: the previous answer is done being read.
   if (run.forkID) {
@@ -1115,7 +1146,7 @@ async function runCommand(cmd: Command): Promise<void> {
       // Generation mode cannot call tools: a reply that tries to (read a file,
       // look something up) comes back empty or stops mid-sentence. Say so, and
       // say "don't guess" too - silence alone would invite making something up.
-      const prompt = `${asideFraming("btw")}\n\n${cmd.text}`;
+      const prompt = `${asideFraming("btw")}\n\n要回答的问题：\n${cmd.text}`;
       const answer = (await client().session.generate({ sessionID: target, prompt })).text.trim();
       const body = answer
         ? answer.length > 3500
@@ -1684,8 +1715,12 @@ async function run(): Promise<number> {
     server = Bun.serve({
       hostname: "127.0.0.1",
       port: LOCK_PORT,
+      // Long enough for the short requests below; a held-open request would still
+      // die mid-aside, which is why the CLI plugin polls a job instead.
+      idleTimeout: 255,
       fetch: async (req) => {
         const url = new URL(req.url);
+
         if (req.method === "POST" && url.pathname === "/aside") {
           const body = (await req.json().catch(() => null)) as { sessionID?: string; question?: string } | null;
           if (!body?.question) {
@@ -1695,24 +1730,30 @@ async function run(): Promise<number> {
           // the one this bridge would target anyway.
           const target = body.sessionID ?? (await mostRecentSession());
           if (!target) return Response.json({ error: "no session to ask about" }, { status: 409 });
+          const question = body.question;
 
-          // `wait=1` answers in the response itself (the CLI plugin renders it in a
-          // dialog); without it the answer goes back as a synthetic message plus a
-          // QQ push.
-          if (url.searchParams.get("wait") !== "1") {
-            void runAsideTui(target, body.question);
-            return Response.json({ ok: true });
-          }
-          const run = await runAsideTui(target, body.question);
-          return Response.json({
-            ok: !run.error,
-            answer: run.error ? undefined : asideBody(run, 12_000),
-            error: run.error,
-            finished: run.finished,
-            branch: run.forkNum,
-            forkID: run.forkID,
-          });
+          const jobID = newJobID();
+          asideJobs.set(jobID, { state: "running" });
+          void (async () => {
+            const run = await runAsideTui(target, question);
+            asideJobs.set(jobID, {
+              state: "done",
+              answer: run.error ? undefined : asideBody(run, 12_000),
+              error: run.error,
+              branch: run.forkNum,
+              forkID: run.forkID,
+            });
+            setTimeout(() => asideJobs.delete(jobID), ASIDE_JOB_TTL_MS);
+          })();
+          return Response.json({ ok: true, jobID });
         }
+
+        if (req.method === "GET" && url.pathname === "/aside/status") {
+          const job = asideJobs.get(url.searchParams.get("id") ?? "");
+          if (!job) return Response.json({ error: "unknown job" }, { status: 404 });
+          return Response.json(job);
+        }
+
         return new Response("opencode-notify-qq bridge\n");
       },
     });

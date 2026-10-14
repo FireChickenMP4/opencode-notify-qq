@@ -87,22 +87,36 @@ export default Plugin.define({
     ): Promise<{ answer?: string; error?: string; forkID?: string; branch?: number }> {
       try {
         onSent?.(`「${question.slice(0, 40)}」正在一次性分支里跑，约 30–120 秒；跑完会跳到那个分支。`);
-        const res = await fetch(`${BRIDGE}/aside?wait=1`, {
+        // Start a job and poll it: one request held open for minutes would be closed
+        // by the server's idle timeout before the aside ever finishes.
+        const start = await fetch(`${BRIDGE}/aside`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ sessionID: currentSession(), question }),
-          signal: AbortSignal.timeout(TIMEOUT_MS),
+          signal: AbortSignal.timeout(30_000),
         });
-        const data = (await res.json()) as {
-          answer?: string;
-          error?: string;
-          ok?: boolean;
-          forkID?: string;
-          branch?: number;
-        };
-        if (data.error) return { error: data.error };
-        if (!data.ok && !data.answer) return { error: `bridge 返回 ${res.status}` };
-        return { answer: data.answer, forkID: data.forkID, branch: data.branch };
+        const started = (await start.json()) as { ok?: boolean; error?: string; jobID?: string };
+        if (!started.ok || !started.jobID) return { error: started.error ?? `bridge 返回 ${start.status}` };
+
+        const deadline = Date.now() + TIMEOUT_MS;
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 2000));
+          if (Date.now() > deadline) return { error: "等待旁问答案超时" };
+          const res = await fetch(`${BRIDGE}/aside/status?id=${encodeURIComponent(started.jobID)}`, {
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (res.status === 404) return { error: "bridge 不认识这个任务（可能它重启过）" };
+          const job = (await res.json()) as {
+            state?: string;
+            answer?: string;
+            error?: string;
+            forkID?: string;
+            branch?: number;
+          };
+          if (job.state !== "done") continue;
+          if (job.error) return { error: job.error };
+          return { answer: job.answer, forkID: job.forkID, branch: job.branch };
+        }
       } catch (cause) {
         const why = cause instanceof Error ? cause.message : String(cause);
         return { error: `${why}（bridge 没在 127.0.0.1:${BRIDGE.split(":").pop()} 上？）` };
