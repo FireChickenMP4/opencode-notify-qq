@@ -67,3 +67,11 @@ describe("setAwayNotify", () => {
     expect(after.somethingElse).toBe(42);
   });
 });
+
+describe("asideTools parsing", () => {
+  test("read-only unless the file asks for full", () => {
+    expect(loadConfig(temp(JSON.stringify(creds))).asideTools).toBe("readonly");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "full" }))).asideTools).toBe("full");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "nonsense" }))).asideTools).toBe("readonly");
+  });
+});

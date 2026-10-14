@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, parseCommand, parseReply, questionOf, renderTranscript } from "../src/bridge";
+import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -60,6 +60,16 @@ describe("parseCommand", () => {
 
   test("stop takes no body", () => {
     expect(parseCommand(".stop")).toEqual({ kind: "stop" });
+  });
+
+  test("bt is the tool-using side question, btw stays the plain one", () => {
+    expect(parseCommand(".bt read the log and say why it failed")).toEqual({
+      kind: "bt",
+      text: "read the log and say why it failed",
+    });
+    expect(parseCommand(".btw why did it fail")).toEqual({ kind: "btw", text: "why did it fail" });
+    expect(parseCommand(".bt #2 check the build")).toEqual({ kind: "bt", text: "check the build", target: 2 });
+    expect(parseCommand(".bt")).toBeUndefined();
   });
 
   test("status takes no body, any dot or case", () => {
@@ -243,5 +253,26 @@ describe("parseReply Chinese dot", () => {
   test("。a is accepted like .a", () => {
     expect(parseReply("。a")).toBe("always");
     expect(parseReply("。r")).toBe("reject");
+  });
+});
+
+describe("lastAssistantText", () => {
+  test("takes the last text of the forked turn", () => {
+    const msgs = [
+      { type: "user", text: "question" },
+      { type: "assistant", content: [{ type: "text", text: "inherited from the parent" }] },
+      { type: "assistant", content: [{ type: "text", text: "from the parent, later" }] },
+      { type: "assistant", content: [{ type: "tool", name: "read" }] },
+      { type: "assistant", content: [{ type: "text", text: "the answer" }] },
+    ];
+    expect(lastAssistantText(msgs, 2)).toBe("the answer");
+  });
+
+  test("never falls back to what the parent said", () => {
+    const msgs = [
+      { type: "assistant", content: [{ type: "text", text: "the parent's own words" }] },
+      { type: "assistant", content: [{ type: "tool", name: "read" }] },
+    ];
+    expect(lastAssistantText(msgs, 1)).toBe("");
   });
 });

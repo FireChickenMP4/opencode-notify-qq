@@ -268,3 +268,34 @@ bridge 用 orm.created / orm.replied / orm.cancelled 维护待回答表，
 `context.keymap.layer({ commands: [{ bind, slash, palette, run }] })`）注册；服务端插件只能用
 `ctx.command.transform` 注册命令（没有 bind）。命令是否打断回合由投递方式决定
 （`session.prompt({ delivery: "steer" | "queue" })`），所以「不打断」两种入口都能做到。
+
+
+### 带工具的旁问：.bt（新建）
+
+`session.generate`（`.btw`）按定义用不了工具，所以「要读文件/查网页」的旁问只能换一种形态：
+**不做记录的 fork**。
+
+流程（全部实测）：
+
+1. `session.fork({ sessionID })` —— 分支继承父会话的历史（实测 30/31 条）；父会话正在跑也不影响。
+2. `session.update({ sessionID: fork, permissions: [...] })` —— V2 的 action 名是
+   `read` / `glob` / `grep` / `webfetch` / `websearch` / `edit`（涵盖 write、patch）/ `shell`，
+   **不是** V1 的 `write` / `bash`：名字写错会静默不匹配（默认策略是 `{"action":"*","effect":"allow"}`），
+   看起来就像"权限没生效"。deny 是把工具从模型手里摘掉，而不是运行时拒绝。
+   默认只读，配置 `asideTools: "full"` 可放开成普通回合的权限。
+3. `session.prompt({ sessionID: fork, text })` 提问，然后轮询 `session.context()`：最后一条是
+   assistant、`finish !== "tool-calls"`、且带 `time.completed` 才算答完（不依赖事件簿记，
+   child 会话的事件不是必到）。
+4. 取答案：`context()` 返回的**就是消息数组**（没有 `{ info, parts }` 包裹），part 在
+   `msg.content` 里（不是 `parts`）。只看 fork 前缀之后的消息，否则可能把父会话自己的话当成答案。
+5. `session.remove({ sessionID: fork })` —— 分支连同它的记录一起消失，主会话毫发无损。
+
+实现要点：
+
+- **必须 detached**：一轮带工具的问答要几十秒到几分钟，而网关是 `await runCommand` 串行的，
+  会挡住 `.stop` 和审批回复；所以先 ack，再 `void runAside(...)`，错误在内部捕获并回推。
+- fork 出来的会话 `parentID` 非空，通知插件按子代理处理，所以它结束**不会**弹窗/推送。
+- `.bt` 只读时，如果答案要读工作区外的路径，会走 `external_directory` 的 `ask`（默认策略），
+  也就是通过既有的审批推送来问你，行为与普通回合一致。
+- 超时 `OPENCODE_NOTIFY_QQ_ASIDE_TIMEOUT_MS`（默认 300s），超时回一条「还没答完」。
+- 成本：fork 继承上下文，一次 `.bt` 的输入 token 约等于父会话上下文 + 工具往返；只想省 token 用 `.btw`。

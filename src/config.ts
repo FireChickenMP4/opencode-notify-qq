@@ -53,6 +53,14 @@ export type NotifyConfig = {
    * which is exactly when you need to turn it on.
    */
   awayNotify: boolean;
+  /**
+   * Tools available to `.bt`, the side question that may use them.
+   *
+   * "readonly" (default) lets it read files and search the web, and denies
+   * everything that writes or runs a command. "full" gives the forked session
+   * whatever permissions a normal turn has.
+   */
+  asideTools: "readonly" | "full";
 };
 
 /** Default: away notifications are OFF. */
@@ -124,7 +132,11 @@ export function loadConfig(path = configPath()): NotifyConfig {
     if (typeof enabled === "boolean") awayNotify = enabled;
   }
 
-  return { ...(qqbot ? { qqbot } : {}), awayNotify };
+  return {
+    ...(qqbot ? { qqbot } : {}),
+    awayNotify,
+    asideTools: raw.asideTools === "full" ? "full" : "readonly",
+  };
 }
 
 /**

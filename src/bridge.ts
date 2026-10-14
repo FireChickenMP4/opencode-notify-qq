@@ -229,7 +229,7 @@ export function parseReply(text: string): Verdict | undefined {
 // ---------------------------------------------------------------------------
 
 export type Command =
-  | { kind: "task" | "ask" | "btw" | "answer"; text: string; target?: number }
+  | { kind: "task" | "ask" | "btw" | "bt" | "answer"; text: string; target?: number }
   | { kind: "stop"; target?: number }
   | { kind: "status"; target?: number };
 
@@ -241,6 +241,8 @@ export type Command =
  *   .ask  <text>      steer into the running turn immediately
  *   .btw  <question>  one-shot answer from the session's context, without touching
  *                     the conversation or the running turn
+ *   .bt   <question>  side question that MAY use tools: answered in a throwaway
+ *                     fork of the session, so it still leaves no trace
  *   .answer <text>    answer the question the agent is waiting on (`.answer` with
  *                     nothing waiting is a no-op)
  *   .stop             abort the running turn (highest priority)
@@ -251,9 +253,9 @@ export type Command =
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|answer|stop|status)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|bt|answer|stop|status)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "answer" | "stop" | "status";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "bt" | "answer" | "stop" | "status";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -444,6 +446,8 @@ const PART_LINES = 4;
 
 /** Max characters per transcript line. */
 const LINE_CHARS = 120;
+/** How long `.bt` waits for its tool-using turn before it reports a timeout. */
+const ASIDE_TIMEOUT_MS = Number(process.env.OPENCODE_NOTIFY_QQ_ASIDE_TIMEOUT_MS ?? 300_000);
 
 /** V2 content parts: assistant output is tagged `text` | `reasoning` | `tool`. */
 type Part = {
@@ -458,6 +462,7 @@ type Msg = {
   type?: string;
   text?: string;
   content?: Part[];
+  finish?: string;
   time?: { created?: number; completed?: number };
 };
 
@@ -532,6 +537,68 @@ export function renderTranscript(msgs: Msg[], maxLines = STATUS_LINES): string[]
 type SessionSnapshot = { transcript: string[]; turnStart?: number; lastActivity?: number };
 
 /** Fetch the transcript and derive the turn start plus last-activity times. */
+/** Raw messages of a session. The context route returns the array itself. */
+async function sessionMessages(sessionID: string): Promise<Msg[]> {
+  const raw = (await client().session.context({ sessionID })) as unknown;
+  return Array.isArray(raw) ? (raw as Msg[]) : ((raw as { messages?: Msg[] })?.messages ?? []);
+}
+
+/**
+ * The answer of a forked turn: the last assistant text after the inherited
+ * prefix. Starting at `from` keeps a fork that only made tool calls from
+ * quoting the parent's own words back at you.
+ */
+export function lastAssistantText(msgs: Msg[], from: number): string {
+  for (let i = msgs.length - 1; i >= from; i--) {
+    const msg = msgs[i];
+    if (msg?.type !== "assistant") continue;
+    const text = (msg.content ?? [])
+      .filter((p) => p?.type === "text" && typeof p.text === "string")
+      .map((p) => p.text!)
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+/**
+ * Wait for the forked session to finish a turn: its last message is an assistant
+ * message that is not a tool round. Polling the transcript keeps this off the
+ * event bookkeeping, which only tracks sessions we are told about.
+ */
+async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(700);
+    const msgs = await sessionMessages(sessionID).catch(() => [] as Msg[]);
+    if (msgs.length <= baseline) continue;
+    const last = msgs[msgs.length - 1];
+    if (last?.type === "assistant" && last.finish && last.finish !== "tool-calls" && last.time?.completed) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Permission rules for `.bt`. Read-only by default: the answer may read files
+ * and search the web, but nothing that writes or runs a command. Setting
+ * `asideTools` to "full" in the config file drops the restriction entirely.
+ */
+function asidePermissions(): { action: string; resource: string; effect: "allow" | "deny" }[] {
+  if (loadConfig().asideTools === "full") return [];
+  return [
+    { action: "read", resource: "*", effect: "allow" },
+    { action: "glob", resource: "*", effect: "allow" },
+    { action: "grep", resource: "*", effect: "allow" },
+    { action: "webfetch", resource: "*", effect: "allow" },
+    { action: "websearch", resource: "*", effect: "allow" },
+    { action: "edit", resource: "*", effect: "deny" },
+    { action: "shell", resource: "*", effect: "deny" },
+  ];
+}
+
 async function fetchSessionSnapshot(sessionID: string): Promise<SessionSnapshot> {
   try {
     const msgs = (await client().session.context({ sessionID })) as unknown as Msg[];
@@ -600,6 +667,47 @@ async function sendStatus(target?: number): Promise<void> {
   log("command: status");
 }
 
+/**
+ * Answer `.bt`: a side question that may use tools.
+ *
+ * The question runs in a fork of the session, so it sees the conversation and
+ * gets working tools, and the fork is deleted afterwards - nothing of it shows
+ * up in the real transcript. Runs detached: a tool-using turn takes minutes, and
+ * `.stop` plus approvals must not queue behind it.
+ */
+async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<void> {
+  let forkID: string | undefined;
+  try {
+    const fork = await client().session.fork({ sessionID: target });
+    forkID = fork?.id;
+    if (!forkID) throw new Error("fork 没有返回会话 id");
+
+    const rules = asidePermissions();
+    if (rules.length) await client().session.update({ sessionID: forkID, permissions: rules });
+
+    const baseline = (await sessionMessages(forkID)).length;
+    await client().session.prompt({ sessionID: forkID, text: question });
+    const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
+    const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();
+    const body = answer
+      ? answer.length > 3500
+        ? `${answer.slice(0, 3500)}...`
+        : answer
+      : finished
+        ? "(没有内容)"
+        : "(超时 —— 这一轮还没答完，先用 .status 看看)";
+    const heading = num !== undefined ? `**opencode · 旁问(工具) · #${num}**` : "**opencode · 旁问(工具)**";
+    await sendWithRetry(`${heading}\n\n\`${tag}\` ${question.slice(0, 80)}\n\n---\n\n${body}`);
+    log(`bt answered for ${target} via ${forkID} (${finished ? "done" : "timeout"}): ${preview(question)}`);
+  } catch (cause) {
+    const why = cause instanceof Error ? cause.message : String(cause);
+    log(`bt failed for ${target}: ${why}`);
+    await sendText(`旁问(工具)失败 ${tag}：${why}`);
+  } finally {
+    if (forkID) await client().session.remove({ sessionID: forkID }).catch(() => {});
+  }
+}
+
 async function runCommand(cmd: Command): Promise<void> {
   if (cmd.kind === "status") {
     await sendStatus(cmd.target);
@@ -625,6 +733,16 @@ async function runCommand(cmd: Command): Promise<void> {
     // not added to the conversation, so it disturbs neither the running turn nor
     // the transcript. A model call takes seconds, so acknowledge first - `.task`
     // answers immediately and the silence here would look like a failure.
+    // .bt is the side question that may use tools: fork the session (so the
+    // question understands what you were talking about), let it read and search,
+    // then throw the fork away. Detached, because `.stop` must stay responsive.
+    if (cmd.kind === "bt") {
+      const question = cmd.text;
+      await sendText(`旁问(工具)已发出 ${tag}，跑完回你：${question.slice(0, 80)}`);
+      void runAside(target, num, tag, question);
+      return;
+    }
+
     if (cmd.kind === "btw") {
       await sendText(`旁问已发出 ${tag}，稍后回你：${cmd.text.slice(0, 80)}`);
 
