@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { fmtAgo, fmtDuration, formatStatus, parseCommand, parseReply, renderTranscript } from "../src/bridge";
+import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, parseCommand, parseReply, questionOf, renderTranscript } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -55,6 +55,7 @@ describe("parseCommand", () => {
     expect(parseCommand(".task fix the bug")).toEqual({ kind: "task", text: "fix the bug" });
     expect(parseCommand(".ask what about x")).toEqual({ kind: "ask", text: "what about x" });
     expect(parseCommand(".btw why did it fail")).toEqual({ kind: "btw", text: "why did it fail" });
+    expect(parseCommand(".answer 生产")).toEqual({ kind: "answer", text: "生产" });
   });
 
   test("stop takes no body", () => {
@@ -193,6 +194,48 @@ describe("status formatting", () => {
       transcript: [],
     });
     expect(out).toBe("会话 #1 E:\\repo · 空闲（最后活动 4m00s 前） | 事件 4m00s 前 | 待审批 2 | 网关 disconnected");
+  });
+});
+
+describe("form replies", () => {
+  const fields = [
+    {
+      key: "answer",
+      type: "string",
+      title: "部署到哪个环境？",
+      options: [
+        { value: "prod", label: "生产" },
+        { value: "dev", label: "开发" },
+      ],
+    },
+  ];
+
+  test("an option label or value maps to the option value", () => {
+    expect(buildAnswer(fields, "开发")).toEqual({ answer: "dev" });
+    expect(buildAnswer(fields, "prod")).toEqual({ answer: "prod" });
+    expect(buildAnswer(fields, " 生产 ")).toEqual({ answer: "prod" });
+  });
+
+  test("free text is sent as-is", () => {
+    expect(buildAnswer(fields, "先别动")).toEqual({ answer: "先别动" });
+  });
+
+  test("a field without a key is not answerable", () => {
+    expect(buildAnswer([{ title: "no key" }], "x")).toBeNull();
+  });
+
+  test("the question push lists the options and the reply hint", () => {
+    const out = formatForm("D:/Desktop", "部署到哪个环境？", fields, 3);
+    expect(out).toContain("**需要你回答 · #3**");
+    expect(out).toContain("部署到哪个环境？");
+    expect(out).toContain("- 生产");
+    expect(out).toContain(".answer");
+  });
+
+  test("questionOf prefers the first titled field, then the form title", () => {
+    expect(questionOf({ title: "form", fields })).toBe("部署到哪个环境？");
+    expect(questionOf({ title: "form", fields: [] })).toBe("form");
+    expect(questionOf(undefined)).toBe("(无标题问题)");
   });
 });
 

@@ -183,6 +183,17 @@ type Pending = { requestID: string; sessionID: string; permission: string };
 
 const pending = new Map<string, Pending>();
 
+/** A form the agent is waiting on (`question` tool); answering it unblocks the run. */
+type FormField = {
+  key?: string;
+  type?: string;
+  title?: string;
+  options?: Array<{ value?: string; label?: string }>;
+};
+type PendingForm = { formID: string; sessionID: string; question: string; fields: FormField[] };
+
+const pendingForms = new Map<string, PendingForm>();
+
 type Verdict = "once" | "always" | "reject";
 
 /**
@@ -218,7 +229,7 @@ export function parseReply(text: string): Verdict | undefined {
 // ---------------------------------------------------------------------------
 
 export type Command =
-  | { kind: "task" | "ask" | "btw"; text: string; target?: number }
+  | { kind: "task" | "ask" | "btw" | "answer"; text: string; target?: number }
   | { kind: "stop"; target?: number }
   | { kind: "status"; target?: number };
 
@@ -230,6 +241,8 @@ export type Command =
  *   .ask  <text>      steer into the running turn immediately
  *   .btw  <question>  one-shot answer from the session's context, without touching
  *                     the conversation or the running turn
+ *   .answer <text>    answer the question the agent is waiting on (`.answer` with
+ *                     nothing waiting is a no-op)
  *   .stop             abort the running turn (highest priority)
  *   .status           report the target session's turn/tool state (stuck detector)
  *
@@ -238,9 +251,9 @@ export type Command =
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|stop|status)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|answer|stop|status)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "stop" | "status";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "answer" | "stop" | "status";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -619,6 +632,25 @@ async function runCommand(cmd: Command): Promise<void> {
       return;
     }
 
+    // .answer replies to the question the agent is waiting on. With nothing
+    // waiting it is a no-op, exactly like a stale approval reply.
+    if (cmd.kind === "answer") {
+      await reconcileForms(target);
+      const form = [...pendingForms.values()].find((f) => f.sessionID === target);
+      if (!form) {
+        await sendText(`没有待回答的问题（可能已在电脑上处理）· ${tag}`);
+        log("answer ignored: no pending form");
+        return;
+      }
+      const answer = buildAnswer(form.fields, cmd.text);
+      if (!answer) throw new Error("这个表单没有可回答的字段");
+      await client().session.form.reply({ sessionID: target, formID: form.formID, answer });
+      pendingForms.delete(form.formID);
+      await sendText(`已回答 ${tag}: ${cmd.text.slice(0, 60)}`);
+      log(`form ${form.formID} answered`);
+      return;
+    }
+
     if (cmd.kind === "ask") {
       // .ask means "steer into the running turn"; the default delivery does that.
       await prompt(target, cmd.text);
@@ -757,6 +789,75 @@ export function formatPermission(
   return lines.join("\n");
 }
 
+/** The question text of a form: the first titled field, else the form's own title. */
+export function questionOf(form: { title?: string; fields?: FormField[] } | undefined): string {
+  const fields = Array.isArray(form?.fields) ? form.fields : [];
+  const first = fields.find((f) => typeof f.title === "string" && f.title);
+  return first?.title ?? form?.title ?? "(无标题问题)";
+}
+
+/**
+ * Map a typed reply onto the form's first field.
+ *
+ * Matching an option's value or label wins, so `.answer 生产` sends the value the
+ * form expects; anything else is sent as free text. Only the first field is
+ * answerable - the `question` tool builds single-question forms.
+ */
+export function buildAnswer(fields: FormField[], text: string): Record<string, string> | null {
+  const field = fields.find((f) => typeof f.key === "string" && f.key);
+  if (!field?.key) return null;
+  const typed = text.trim();
+  const wanted = typed.toLowerCase();
+  const options = Array.isArray(field.options) ? field.options : [];
+  const hit = options.find((o) => {
+    const value = typeof o.value === "string" ? o.value.toLowerCase() : "";
+    const label = typeof o.label === "string" ? o.label.toLowerCase() : "";
+    return value === wanted || label === wanted;
+  });
+  return { [field.key]: hit && typeof hit.value === "string" ? hit.value : typed };
+}
+
+/** Render a waiting question for QQ. Pure, so the layout is testable. */
+export function formatForm(
+  directory: string,
+  question: string,
+  fields: FormField[],
+  sessionNum?: number,
+): string {
+  const header = sessionNum !== undefined ? `**需要你回答 · #${sessionNum}**` : `**需要你回答**`;
+  const lines = [header, `目录: \`${directory}\``, "", question];
+
+  const first = fields.find((f) => typeof f.key === "string" && f.key);
+  const options = Array.isArray(first?.options) ? first.options : [];
+  if (options.length) {
+    lines.push("");
+    for (const o of options) {
+      const label = (typeof o.label === "string" && o.label) || (typeof o.value === "string" && o.value) || "";
+      lines.push(`- ${label}`);
+    }
+  }
+
+  lines.push("", "回复  **.answer <你的答案>**（可写选项文字或自由文本）");
+  return lines.join("\n");
+}
+
+/** Drop forms the server no longer lists (answered in the TUI, or cancelled). */
+async function reconcileForms(sessionID: string): Promise<void> {
+  const mine = [...pendingForms.values()].filter((f) => f.sessionID === sessionID);
+  if (!mine.length) return;
+  try {
+    const live = new Set<string>((await client().session.form.list({ sessionID })).map((f) => String(f.id)));
+    for (const f of mine) {
+      if (!live.has(f.formID)) {
+        pendingForms.delete(f.formID);
+        log(`pruned stale form ${f.formID}`);
+      }
+    }
+  } catch {
+    /* keep the map on failure */
+  }
+}
+
 async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
   try {
     lastEventAt = Date.now();
@@ -785,6 +886,40 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
       const pid = asString(data.requestID);
       if (pid && pending.delete(pid)) {
         log(`permission ${pid} resolved elsewhere; dropped from pending`);
+      }
+      return;
+    }
+
+    // A question is the other thing that blocks the run, and the bridge is what
+    // answers it (`.answer`), so it pushes it too - not gated by the away switch.
+    if (type === "form.created") {
+      const form = data.form as { id?: string; sessionID?: string; title?: string; fields?: FormField[] } | undefined;
+      const formID = asString(form?.id);
+      if (!formID || pendingForms.has(formID)) return;
+
+      const sessionID = asString(form?.sessionID) ?? "";
+      const fields = Array.isArray(form?.fields) ? form.fields : [];
+      const question = questionOf(form);
+      pendingForms.set(formID, { formID, sessionID, question, fields });
+      if (sessionID) rememberSession(sessionID);
+
+      // The push is the point, so the directory lookup must not throw past it.
+      let directory = "(unknown)";
+      try {
+        if (sessionID) directory = await sessionDirectory(sessionID);
+      } catch {
+        /* keep "(unknown)" */
+      }
+      const num = sessionID ? rememberSession(sessionID) : undefined;
+      await sendWithRetry(formatForm(directory, question, fields, num));
+      log(`form ${formID} (${question.slice(0, 40)}) -> QQ`);
+      return;
+    }
+
+    if (type === "form.replied" || type === "form.cancelled") {
+      const fid = asString(data.id);
+      if (fid && pendingForms.delete(fid)) {
+        log(`form ${fid} resolved elsewhere; dropped from pending`);
       }
       return;
     }

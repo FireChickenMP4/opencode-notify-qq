@@ -245,3 +245,13 @@ bridge 必须单例的原因。
 （%TEMP%/opencode-notify/qq-command/<sessionID>），插件在回合结束时消费它并据此放行；
 只有插件一侧发送，所以开关开着时也不会与自动推送重复（幂等）。标记带 TTL，
 默认 6 小时，OPENCODE_NOTIFY_QQ_OUTCOME_TTL_MS 可调。
+
+
+### 提问也是「需要回应」（新增 .answer）
+
+question 工具在 V2 表现为 orm.created。它和审批一样需要你回应，所以同样不受
+wayNotify 管：bridge 把题目与选项推给你，回 .answer <内容> 回答
+（session.form.reply({sessionID, formID, answer})，nswer 是「字段 key -> 值」；
+选项文字会映射成选项的 value，其他按自由文本发）。没有待回答的表单时该命令无效。
+bridge 用 orm.created / orm.replied / orm.cancelled 维护待回答表，
+并在命令前用 session.form.list({sessionID}) 剔除已失效的。
