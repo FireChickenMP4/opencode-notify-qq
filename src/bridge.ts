@@ -922,7 +922,7 @@ async function sweepOrphanAsides(): Promise<void> {
 async function runAsideCore(
   target: string,
   question: string,
-  onReady?: (info: { forkNum?: number; agent: string; agentError?: string }) => Promise<void> | void,
+  onReady?: (info: { forkID: string; forkNum?: number; agent: string; agentError?: string }) => Promise<void> | void,
   keep = false,
 ): Promise<AsideRun> {
   let forkID: string | undefined;
@@ -954,7 +954,7 @@ async function runAsideCore(
         log(`aside agent switch to ${config.asideAgent} failed: ${agentError}`);
       }
     }
-    if (onReady) await onReady({ forkNum, agent: config.asideAgent, agentError });
+    if (onReady) await onReady({ forkID, forkNum, agent: config.asideAgent, agentError });
 
     const rules = asideRules(config.asideTools, sandbox);
     await client().session.update({
@@ -1016,7 +1016,8 @@ async function runAside(
   const run = await runAsideCore(
     target,
     question,
-    async ({ forkNum, agent, agentError }) => {
+    async ({ forkID, forkNum, agent, agentError }) => {
+      asidePush.set(forkID, push);
       if (!push) return;
       const who = agentError
         ? `agent 换不上（${agentError}），沿用会话自己的`
@@ -1027,6 +1028,7 @@ async function runAside(
     },
     options.keep === true,
   );
+  if (run.forkID) asidePush.delete(run.forkID);
   if (run.error) {
     if (push) await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
     return run;
@@ -1045,6 +1047,14 @@ async function runAside(
 
 /** The last branch a TUI `/bt` kept for reading; the next one replaces it. */
 let lastKeptAside: string | undefined;
+
+/**
+ * Whether each running aside wants its approvals pushed. A QQ `.bt` does (it was
+ * asked from the phone, so waiting for an approval nobody sees would hang it); a
+ * TUI `/bt` does not (the TUI asks on screen). Keyed by fork id, dropped when the
+ * aside ends.
+ */
+const asidePush = new Map<string, boolean>();
 
 /**
  * `/bt` from the TUI: run it, keep the branch, and let the CLI plugin navigate to
@@ -1485,11 +1495,13 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
     const aside = anySessionID ? asideIds.has(anySessionID) || asideSeen.has(anySessionID) : false;
 
     pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
-    // Tracked above either way (the aside wait and the QQ reply both use it); the
-    // push itself follows the away switch, so at the computer only the TUI asks.
-    if (loadConfig().awayNotify) {
+    // Tracked above either way (the aside wait and the QQ reply both use it). The
+    // push follows the away switch - except for an aside that was itself asked from
+    // QQ: waiting for an approval nobody sees would hang it.
+    const asideWantsPush = anySessionID ? asidePush.get(anySessionID) === true : false;
+    if (loadConfig().awayNotify || asideWantsPush) {
       await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
-      log(`permission ${requestID} (${permission}) -> QQ`);
+      log(`permission ${requestID} (${permission}) -> QQ${asideWantsPush ? " (aside)" : ""}`);
     } else {
       log(`permission ${requestID} (${permission}) not pushed (awayNotify off)`);
     }
