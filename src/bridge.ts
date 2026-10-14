@@ -505,6 +505,8 @@ const PART_LINES = 4;
 const LINE_CHARS = 120;
 /** How long `.bt` waits for its tool-using turn before it reports a timeout. */
 const ASIDE_TIMEOUT_MS = Number(process.env.OPENCODE_NOTIFY_QQ_ASIDE_TIMEOUT_MS ?? 300_000);
+/** Absolute cap on one aside even while approvals are pending: no runaway side questions. */
+const ASIDE_MAX_MS = Number(process.env.OPENCODE_NOTIFY_QQ_ASIDE_MAX_MS ?? 900_000);
 
 /** V2 content parts: assistant output is tagged `text` | `reasoning` | `tool`. */
 type Part = {
@@ -652,9 +654,13 @@ function sessionHasPending(sessionID: string): boolean {
  * an aside that stopped to ask is not a stuck aside.
  */
 async function waitForTurnEnd(sessionID: string, baseline: number, timeoutMs: number): Promise<boolean> {
+  const hardStop = Date.now() + ASIDE_MAX_MS;
   let deadline = Date.now() + timeoutMs;
   for (;;) {
     await sleep(700);
+    // A runaway aside (a "go test the TUI" can turn into hundreds of steps) is
+    // worse than a missing answer, so approvals do not extend this cap.
+    if (Date.now() >= hardStop) return false;
     if (sessionHasPending(sessionID)) {
       deadline = Date.now() + timeoutMs;
       continue;
