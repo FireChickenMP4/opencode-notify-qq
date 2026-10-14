@@ -1022,27 +1022,18 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
 }
 
 /**
- * `/bt` from the TUI: the same run, and the answer goes out both ways.
+ * `/bt` from the TUI: the same run, tagged with the session it was asked from.
  *
- * The QQ push is not decoration: a `synthetic` message is stored in the session
- * but the TUI does not render it (verified - the text was in the transcript and
- * yet invisible), so a TUI-only aside would answer into the void.
+ * The answer is NOT injected as a `synthetic` message: the TUI does not render
+ * one, while the model receives it as if the user had typed it (verified - an
+ * aside answer came back as user input and started a turn). The CLI plugin
+ * renders the answer, and the QQ push is the other delivery.
  */
 async function runAsideTui(sessionID: string, question: string): Promise<AsideRun> {
   const directory = await sessionDirectory(sessionID).catch(() => "?");
   const num = sessionNumbers.lookup(sessionID);
   const tag = `[${num !== undefined ? `#${num} ` : ""}${directory}]`;
-  const run = await runAside(sessionID, num, tag, question);
-
-  const branch = run.forkNum !== undefined ? `（分支 #${run.forkNum}）` : "";
-  const body = run.error ? `失败：${run.error}` : asideBody(run, 12_000);
-  try {
-    await client().session.synthetic({ sessionID, text: `**旁问${branch}**\n\n${body}` });
-    log(`bt(tui) posted the answer into ${sessionID}: ${preview(question)}`);
-  } catch (cause) {
-    log(`bt(tui) could not post the answer: ${cause instanceof Error ? cause.message : cause}`);
-  }
-  return run;
+  return runAside(sessionID, num, tag, question);
 }
 
 async function runCommand(cmd: Command): Promise<void> {
