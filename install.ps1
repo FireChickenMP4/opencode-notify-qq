@@ -40,6 +40,13 @@ foreach ($m in $modules) {
     Copy-Item (Join-Path $repo "src\$m") (Join-Path $srcDir $m) -Force
 }
 Copy-Item (Join-Path $repo "plugins\notify-qq.ts") (Join-Path $pluginsDir "notify-qq.ts") -Force
+
+# TUI plugin of the aside (`/bt`): a directory under plugins/ is discovered as a
+# plugin, with the server and TUI entrypoints kept together.
+$tuiDir = Join-Path $pluginsDir "bt-tui"
+New-Item -ItemType Directory -Force -Path $tuiDir | Out-Null
+Copy-Item (Join-Path $repo "plugins\tui-bt\index.ts") (Join-Path $tuiDir "index.ts") -Force
+Copy-Item (Join-Path $repo "plugins\tui-bt\tui.ts") (Join-Path $tuiDir "tui.ts") -Force
 Copy-Item (Join-Path $repo "src\notify-qq.ps1") (Join-Path $srcDir "notify-qq.ps1") -Force
 
 # Runtime deps must be resolvable from the installed plugin and bridge; they are

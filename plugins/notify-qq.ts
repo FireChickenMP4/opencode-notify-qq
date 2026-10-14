@@ -349,35 +349,9 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
 
   await ensureBridge();
 
-  // `/bt <问题>`: the aside with tools, asked from the TUI. The bridge owns that
-  // logic, so this only forwards the question; the bridge drops the answer back
-  // into the session as a synthetic message when it is ready.
-  const bridgePort = Number(process.env.OPENCODE_NOTIFY_QQ_LOCK_PORT ?? 4097);
-  await ctx.command.transform((editor) => {
-    editor.add({
-      name: "bt",
-      description: "旁问（带工具）：在一次性分支里跑一轮，答案回写到本会话",
-      execute: async ({ sessionID, prompt }) => {
-        try {
-          const res = await fetch(`http://127.0.0.1:${bridgePort}/aside`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ sessionID, question: prompt.text }),
-          });
-          const data = (await res.json()) as { ok?: boolean; error?: string };
-          if (!data.ok) throw new Error(data.error ?? `bridge responded ${res.status}`);
-        } catch (cause) {
-          const why = cause instanceof Error ? cause.message : String(cause);
-          await ctx.session
-            .synthetic({
-              sessionID,
-              text: `**旁问**\n\n启动失败：${why}（bridge 没在 127.0.0.1:${bridgePort} 上？）`,
-            })
-            .catch(() => {});
-        }
-      },
-    });
-  });
+  // The TUI's `/bt` is a CLI plugin (see plugins/tui-bt) so its answer can be
+  // rendered in a dialog; registering it here as well would put two same-named
+  // commands in the palette.
 
   /**
    * Identify the session's workspace unambiguously.

@@ -1028,7 +1028,7 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
  * but the TUI does not render it (verified - the text was in the transcript and
  * yet invisible), so a TUI-only aside would answer into the void.
  */
-async function runAsideTui(sessionID: string, question: string): Promise<void> {
+async function runAsideTui(sessionID: string, question: string): Promise<AsideRun> {
   const directory = await sessionDirectory(sessionID).catch(() => "?");
   const num = sessionNumbers.lookup(sessionID);
   const tag = `[${num !== undefined ? `#${num} ` : ""}${directory}]`;
@@ -1042,6 +1042,7 @@ async function runAsideTui(sessionID: string, question: string): Promise<void> {
   } catch (cause) {
     log(`bt(tui) could not post the answer: ${cause instanceof Error ? cause.message : cause}`);
   }
+  return run;
 }
 
 async function runCommand(cmd: Command): Promise<void> {
@@ -1646,12 +1647,29 @@ async function run(): Promise<number> {
         const url = new URL(req.url);
         if (req.method === "POST" && url.pathname === "/aside") {
           const body = (await req.json().catch(() => null)) as { sessionID?: string; question?: string } | null;
-          if (!body?.sessionID || !body.question) {
-            return Response.json({ error: "sessionID and question are required" }, { status: 400 });
+          if (!body?.question) {
+            return Response.json({ error: "question is required" }, { status: 400 });
           }
-          // Detached: the answer lands in the session once it is ready.
-          void runAsideTui(body.sessionID, body.question);
-          return Response.json({ ok: true });
+          // The TUI cannot always name the session it is showing, so fall back to
+          // the one this bridge would target anyway.
+          const target = body.sessionID ?? (await mostRecentSession());
+          if (!target) return Response.json({ error: "no session to ask about" }, { status: 409 });
+
+          // `wait=1` answers in the response itself (the CLI plugin renders it in a
+          // dialog); without it the answer goes back as a synthetic message plus a
+          // QQ push.
+          if (url.searchParams.get("wait") !== "1") {
+            void runAsideTui(target, body.question);
+            return Response.json({ ok: true });
+          }
+          const run = await runAsideTui(target, body.question);
+          return Response.json({
+            ok: !run.error,
+            answer: run.error ? undefined : asideBody(run, 12_000),
+            error: run.error,
+            finished: run.finished,
+            branch: run.forkNum,
+          });
         }
         return new Response("opencode-notify-qq bridge\n");
       },
