@@ -2,10 +2,11 @@
  * `/bt` — the side question that may use tools, asked from the TUI.
  *
  * The aside itself runs in the bridge (which owns the config, the fork, the
- * sandbox and the QQ copy), so this plugin only asks for it and shows the answer.
- * It asks with `wait=1`, which holds the HTTP request until the answer is ready,
- * and renders the result in a dialog — the TUI cannot render a `synthetic`
- * message, which is why the server-side command alone answered into the void.
+ * sandbox and the QQ copy), so this plugin only asks for it and then shows where
+ * the answer is. It asks with `wait=1` (the request is held until the answer is
+ * ready), toasts right away so the wait is visible, and navigates to the kept
+ * branch — a real session view renders markdown and scrolls, which a plugin dialog
+ * cannot, and a `synthetic` transcript message is never displayed.
  */
 import { Plugin } from "@opencode/plugin/tui";
 
@@ -23,8 +24,10 @@ export default Plugin.define({
 
     async function ask(
       question: string,
+      onSent?: (message: string) => void,
     ): Promise<{ answer?: string; error?: string; forkID?: string; branch?: number }> {
       try {
+        onSent?.(`「${question.slice(0, 40)}」正在一次性分支里跑，约 30–120 秒；跑完会跳到那个分支。`);
         const res = await fetch(`${BRIDGE}/aside?wait=1`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -62,11 +65,21 @@ export default Plugin.define({
             if (!question) {
               await context.ui.dialog.alert({
                 title: "旁问",
-                message: "用法：`/bt <问题>`（也可用快捷键）。\n\n答案由一次性的旁问分支给出：它懂当前会话的上下文、能用只读工具，答完就把分支删掉。",
+                message:
+                  "用法：`/bt <问题>`（也可用快捷键）。\n\n答案由一次性的旁问分支给出：它懂当前会话的上下文、能用只读工具；跑完会把你跳到那个分支，读完可以 `.stop` 或在下次 `/bt` 时自动替换。",
               });
               return;
             }
-            const { answer, error, forkID, branch } = await ask(question);
+            const { answer, error, forkID, branch } = await ask(question, (sent) => {
+              // The run takes tens of seconds: without this the command looks like
+              // it did nothing at all.
+              context.ui.toast.show({
+                title: "旁问已发出",
+                message: sent,
+                variant: "info",
+                duration: 6000,
+              });
+            });
             if (error || !forkID) {
               await context.ui.dialog.alert({ title: "旁问失败", message: error ?? "bridge 没有返回分支" });
               return;
