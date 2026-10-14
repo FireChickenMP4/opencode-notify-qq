@@ -693,16 +693,20 @@ export function formatList(rows: ListRow[], max = 8): string {
 
 /**
  * The framing every `.btw` / `.bt` prompt carries: those answers are read on a
- * phone, come from a throwaway context, and are not a work order. Your own words
- * (`asidePrompt` in the config file) go last, so they win.
+ * phone, come from a throwaway context, and are not a work order. The user's own
+ * words (`asidePrompt` in the config file) go last, so they win.
  */
-function asideFraming(kind: "btw" | "bt"): string {
-  const shared = "这是 QQ 旁问：答案会直接推送到用户手机上的 QQ，用户要的是结论，不是在派活。";
+export function asideFraming(kind: "btw" | "bt", extra = loadConfig().asidePrompt): string {
+  const shared = [
+    "【QQ 旁问】用户不在电脑前，你这段回答会作为一条 QQ 消息直接推到他手机上。请照这个来写：",
+    "1. 先给结论，再给必要的依据；手机屏幕小，能短就短，不要贴大段代码或长表格；",
+    "2. 不要复述问题、不要汇报过程、不要给「下一步计划」，也不要反问「要不要我继续」；",
+    "3. 用中文，把话说清楚，别堆术语。",
+  ].join("\n");
   const tools =
     kind === "btw"
-      ? "你无法使用任何工具：如果回答需要读文件、查网页或跑命令，就直接说你做不到，不要猜也不要编。"
-      : "你在一个临时的只读分支（fork）里，只有只读工具：不要试图改文件或执行命令（也做不到），也不要把它当成需要继续推进的任务。";
-  const extra = loadConfig().asidePrompt;
+      ? "另外：你没有工具可用 —— 如果回答需要读文件、查网页或跑命令，就用一句话说明「这要看代码/跑一下，请用 .ask 问我」，不要猜、不要编。"
+      : "另外：你在一份用完即弃的临时分支里（主会话不受影响），可以读文件、搜索、查资料，但不能改文件或执行命令 —— 如果回答必须动手才能给出，就用一句话说明「这要动手改/跑一下，请用 .ask 问我」。";
   return [shared, tools, ...(extra ? [extra] : [])].join("\n");
 }
 

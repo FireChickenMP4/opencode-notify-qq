@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
+import { asideFraming, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -311,6 +311,27 @@ describe("isAsideSession", () => {
   test("an ordinary session is not an aside", () => {
     expect(isAsideSession({ title: "插件迁移升级 → v2 适配" })).toBe(false);
     expect(isAsideSession({})).toBe(false);
+  });
+});
+
+describe("asideFraming", () => {
+  test("both kinds say it is a phone-bound aside", () => {
+    expect(asideFraming("btw", "")).toContain("QQ 旁问");
+    expect(asideFraming("bt", "")).toContain("QQ 旁问");
+  });
+
+  test("each kind states its own capability boundary", () => {
+    expect(asideFraming("btw", "")).toContain("没有工具可用");
+    expect(asideFraming("bt", "")).toContain("用完即弃的临时分支");
+  });
+
+  test("the user's own words are appended last", () => {
+    const out = asideFraming("bt", "回答用中文，先给结论");
+    expect(out.trimEnd().endsWith("回答用中文，先给结论")).toBe(true);
+  });
+
+  test("no extra text leaves no dangling blank line", () => {
+    expect(asideFraming("btw", "").endsWith("\n")).toBe(false);
   });
 });
 
