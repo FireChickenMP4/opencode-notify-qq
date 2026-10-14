@@ -886,6 +886,35 @@ async function sendStatus(target?: number): Promise<void> {
 type AsideRun = { forkID?: string; forkNum?: number; answer: string; finished: boolean; error?: string };
 
 /**
+ * Remove aside branches left behind by a previous bridge.
+ *
+ * The fork runs in the server, not here, so a bridge that dies - which every
+ * deploy does - leaves its aside running with nothing left to delete it. Since
+ * only one bridge can hold the port, every aside in the list at startup is by
+ * definition an orphan.
+ */
+async function sweepOrphanAsides(): Promise<void> {
+  try {
+    if (!(await connectClient().catch(() => null))) return;
+    const orphans = (await allSessions()).filter((s) => isAsideSession(s));
+    if (!orphans.length) return;
+    for (const s of orphans) {
+      await client()
+        .session.remove({ sessionID: s.id })
+        .catch(() => {});
+      try {
+        rmSync(asideSandbox(s.id), { recursive: true, force: true });
+      } catch {
+        /* a handle may still hold the directory; it is harmless in temp */
+      }
+    }
+    log(`swept ${orphans.length} orphan aside branch(es) at startup`);
+  } catch (cause) {
+    log(`aside sweep failed: ${cause instanceof Error ? cause.message : cause}`);
+  }
+}
+
+/**
  * Run one aside to completion: fork the session, scope it, ask, wait, read the
  * answer, then delete the fork and its sandbox. Never throws - both callers (QQ
  * `.bt` and the TUI `/bt`) have to say something either way.
@@ -1649,6 +1678,8 @@ async function run(): Promise<number> {
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+
+  await sweepOrphanAsides();
 
   await subscribeEvents((e) => void handleOpencodeEvent(e), abort.signal);
   return 0;
