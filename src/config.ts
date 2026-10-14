@@ -61,6 +61,11 @@ export type NotifyConfig = {
    * whatever permissions a normal turn has.
    */
   asideTools: "readonly" | "full";
+  /**
+   * Extra words appended to every `.btw` / `.bt` prompt: your house style for
+   * those answers (language, shape, what to skip). Empty means none.
+   */
+  asidePrompt: string;
 };
 
 /** Default: away notifications are OFF. */
@@ -136,6 +141,7 @@ export function loadConfig(path = configPath()): NotifyConfig {
     ...(qqbot ? { qqbot } : {}),
     awayNotify,
     asideTools: raw.asideTools === "full" ? "full" : "readonly",
+    asidePrompt: typeof raw.asidePrompt === "string" ? raw.asidePrompt.trim() : "",
   };
 }
 

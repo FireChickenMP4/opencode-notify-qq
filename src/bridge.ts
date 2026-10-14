@@ -113,6 +113,7 @@ type Session = {
   parentID?: string;
   title?: string;
   metadata?: { aside?: boolean };
+  time?: { created?: number; updated?: number };
 };
 
 let sessions: Session[] | null = null;
@@ -238,6 +239,7 @@ export function parseReply(text: string): Verdict | undefined {
 export type Command =
   | { kind: "task" | "ask" | "btw" | "bt" | "answer"; text: string; target?: number }
   | { kind: "stop"; target?: number }
+  | { kind: "list"; target?: number }
   | { kind: "status"; target?: number };
 
 /**
@@ -254,15 +256,16 @@ export type Command =
  *                     nothing waiting is a no-op)
  *   .stop             abort the running turn (highest priority)
  *   .status           report the target session's turn/tool state (stuck detector)
+ *   .list             list the sessions this bridge can address, with their #N
  *
  * Any command may name a session by number: `.stop #2`, `.task #1 do x`. The
  * leading dot accepts ASCII, full-width, or the Chinese ideographic full stop,
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|bt|answer|stop|status)\b\s*([\s\S]*)$/i);
+  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|bt|answer|stop|status|list)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "bt" | "answer" | "stop" | "status";
+  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "bt" | "answer" | "stop" | "status" | "list";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -274,7 +277,7 @@ export function parseCommand(text: string): Command | undefined {
     rest = (t[2] ?? "").trim();
   }
 
-  if (kind === "stop" || kind === "status") return { kind, target };
+  if (kind === "stop" || kind === "status" || kind === "list") return { kind, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
   return { kind, text: rest, target };
 }
@@ -476,6 +479,8 @@ const STUCK_MS = Number(process.env.OPENCODE_NOTIFY_QQ_STUCK_MS ?? 90_000);
 
 /** Default number of transcript lines `.status` shows. */
 const STATUS_LINES = Number(process.env.OPENCODE_NOTIFY_QQ_STATUS_LINES ?? 15);
+/** How many sessions `.list` shows at most (recent first). */
+const LIST_LINES = Number(process.env.OPENCODE_NOTIFY_QQ_LIST_LINES ?? 8);
 
 /** Max lines one text/reasoning part may contribute. */
 const PART_LINES = 4;
@@ -666,6 +671,41 @@ async function fetchSessionSnapshot(sessionID: string): Promise<SessionSnapshot>
   }
 }
 
+/** One row of `.list`. */
+export type ListRow = { num: number; directory: string; state: string; title?: string };
+
+/**
+ * Render `.list`: one line per numbered session, most recent first. Pure, so the
+ * layout is testable.
+ */
+export function formatList(rows: ListRow[], max = 8): string {
+  if (!rows.length) {
+    return "还没有编号过的会话；等 opencode 报一个事件（或发一条 `.status`）之后再看。";
+  }
+  const shown = rows.slice(0, max);
+  const head = `**opencode · 会话列表**（${shown.length}${rows.length > shown.length ? ` / 共 ${rows.length}` : ""}）`;
+  const lines = shown.map((row) => {
+    const title = row.title ? ` · ${row.title.slice(0, 40)}` : "";
+    return `#${row.num} [${row.directory}] ${row.state}${title}`;
+  });
+  return [head, ...lines].join("\n");
+}
+
+/**
+ * The framing every `.btw` / `.bt` prompt carries: those answers are read on a
+ * phone, come from a throwaway context, and are not a work order. Your own words
+ * (`asidePrompt` in the config file) go last, so they win.
+ */
+function asideFraming(kind: "btw" | "bt"): string {
+  const shared = "这是 QQ 旁问：答案会直接推送到用户手机上的 QQ，用户要的是结论，不是在派活。";
+  const tools =
+    kind === "btw"
+      ? "你无法使用任何工具：如果回答需要读文件、查网页或跑命令，就直接说你做不到，不要猜也不要编。"
+      : "你在一个临时的只读分支（fork）里，只有只读工具：不要试图改文件或执行命令（也做不到），也不要把它当成需要继续推进的任务。";
+  const extra = loadConfig().asidePrompt;
+  return [shared, tools, ...(extra ? [extra] : [])].join("\n");
+}
+
 /**
  * Render the `.status` reply. Pure so the layout is testable: a one-line state
  * header, then the last `lines` transcript lines.
@@ -691,6 +731,27 @@ export function formatStatus(input: {
 }
 
 /** Gather live state and reply with it. */
+/** Reply to `.list`: the sessions this bridge can address, most recent first. */
+async function sendList(): Promise<void> {
+  const rows = (await allSessions())
+    .filter((s) => !s.parentID && !isAsideSession(s))
+    .map((s) => ({ s, num: sessionNumbers.lookup(s.id) }))
+    .filter((row): row is { s: Session; num: number } => row.num !== undefined)
+    .sort((a, b) => (b.s.time?.updated ?? 0) - (a.s.time?.updated ?? 0))
+    .map(
+      ({ s, num }): ListRow => ({
+        num,
+        directory: s.directory ?? "?",
+        state: busySessions.has(s.id)
+          ? "运行中"
+          : `空闲（最后活动 ${fmtAgo(s.time?.updated ? Date.now() - s.time.updated : null)}）`,
+        title: s.title,
+      }),
+    );
+  await sendText(formatList(rows, LIST_LINES));
+  log(`command: list (${rows.length} numbered)`);
+}
+
 async function sendStatus(target?: number): Promise<void> {
   const resolved = await resolveTarget(target);
   const id = resolved?.id ?? null;
@@ -742,7 +803,7 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
     });
 
     const baseline = (await sessionMessages(forkID)).length;
-    await client().session.prompt({ sessionID: forkID, text: question });
+    await client().session.prompt({ sessionID: forkID, text: `${asideFraming("bt")}\n\n${question}` });
     const finished = await waitForTurnEnd(forkID, baseline, ASIDE_TIMEOUT_MS);
     const answer = lastAssistantText(await sessionMessages(forkID), baseline).trim();
     const body = answer
@@ -773,6 +834,10 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
 async function runCommand(cmd: Command): Promise<void> {
   if (cmd.kind === "status") {
     await sendStatus(cmd.target);
+    return;
+  }
+  if (cmd.kind === "list") {
+    await sendList();
     return;
   }
   const resolved = await resolveTarget(cmd.target);
@@ -811,9 +876,7 @@ async function runCommand(cmd: Command): Promise<void> {
       // Generation mode cannot call tools: a reply that tries to (read a file,
       // look something up) comes back empty or stops mid-sentence. Say so, and
       // say "don't guess" too - silence alone would invite making something up.
-      const prompt =
-        "只依据你已知的信息与会话上下文直接回答。你无法使用任何工具：如果回答需要读文件、查网页" +
-        "或运行命令，就直接说你做不到，不要猜也不要编：\n\n" + cmd.text;
+      const prompt = `${asideFraming("btw")}\n\n${cmd.text}`;
       const answer = (await client().session.generate({ sessionID: target, prompt })).text.trim();
       const body = answer
         ? answer.length > 3500

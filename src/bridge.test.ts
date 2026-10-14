@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
+import { buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, parseCommand, parseReply, questionOf, renderTranscript, turnEnded } from "../src/bridge";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -58,8 +58,10 @@ describe("parseCommand", () => {
     expect(parseCommand(".answer 生产")).toEqual({ kind: "answer", text: "生产" });
   });
 
-  test("stop takes no body", () => {
+  test("stop and list take no body", () => {
     expect(parseCommand(".stop")).toEqual({ kind: "stop" });
+    expect(parseCommand(".list")).toEqual({ kind: "list" });
+    expect(parseCommand(".LIST")).toEqual({ kind: "list" });
   });
 
   test("bt is the tool-using side question, btw stays the plain one", () => {
@@ -309,5 +311,29 @@ describe("isAsideSession", () => {
   test("an ordinary session is not an aside", () => {
     expect(isAsideSession({ title: "插件迁移升级 → v2 适配" })).toBe(false);
     expect(isAsideSession({})).toBe(false);
+  });
+});
+
+describe("formatList", () => {
+  test("one line per session, with the count in the header", () => {
+    const out = formatList([
+      { num: 1, directory: "D:\\Desktop", state: "运行中", title: "插件迁移升级 → v2 适配" },
+      { num: 2, directory: "E:\\1\\2\\go-zero", state: "空闲（最后活动 12m 前）", title: "查看 patch" },
+    ]);
+    const lines = out.split("\n");
+    expect(lines[0]).toBe("**opencode · 会话列表**（2）");
+    expect(lines[1]).toBe("#1 [D:\\Desktop] 运行中 · 插件迁移升级 → v2 适配");
+    expect(lines[2]).toBe("#2 [E:\\1\\2\\go-zero] 空闲（最后活动 12m 前） · 查看 patch");
+  });
+
+  test("caps the rows and says how many there are", () => {
+    const rows = Array.from({ length: 5 }, (_, i) => ({ num: i + 1, directory: "d", state: "空闲" }));
+    const out = formatList(rows, 2).split("\n");
+    expect(out[0]).toBe("**opencode · 会话列表**（2 / 共 5）");
+    expect(out).toHaveLength(3);
+  });
+
+  test("says so when nothing is numbered yet", () => {
+    expect(formatList([])).toContain("还没有编号过的会话");
   });
 });

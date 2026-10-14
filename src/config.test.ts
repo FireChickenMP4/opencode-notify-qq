@@ -75,3 +75,13 @@ describe("asideTools parsing", () => {
     expect(loadConfig(temp(JSON.stringify({ ...creds, asideTools: "nonsense" }))).asideTools).toBe("readonly");
   });
 });
+
+describe("asidePrompt parsing", () => {
+  test("empty unless the file says something", () => {
+    expect(loadConfig(temp(JSON.stringify(creds))).asidePrompt).toBe("");
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asidePrompt: "  回答用中文，先给结论  " }))).asidePrompt).toBe(
+      "回答用中文，先给结论",
+    );
+    expect(loadConfig(temp(JSON.stringify({ ...creds, asidePrompt: 42 }))).asidePrompt).toBe("");
+  });
+});
