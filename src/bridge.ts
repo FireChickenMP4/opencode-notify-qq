@@ -1000,7 +1000,7 @@ function asideBody(run: AsideRun, max = 3500): string {
  * Detached by the caller: a tool-using turn takes minutes, and `.stop` plus
  * approvals must not queue behind it.
  */
-async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<void> {
+async function runAside(target: string, num: number | undefined, tag: string, question: string): Promise<AsideRun> {
   const run = await runAsideCore(target, question, async ({ forkNum, agent, agentError }) => {
     const who = agentError
       ? `agent 换不上（${agentError}），沿用会话自己的`
@@ -1011,26 +1011,34 @@ async function runAside(target: string, num: number | undefined, tag: string, qu
   });
   if (run.error) {
     await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
-    return;
+    return run;
   }
   const asked = num !== undefined ? `问 #${num}` : "问当前会话";
   await sendWithRetry(
     `**opencode · 旁问(工具) · ${asked}**\n\n\`分支 #${run.forkNum} · ${tag}\` ${question.slice(0, 80)}\n\n---\n\n${asideBody(run)}`,
   );
   log(`bt answered for ${target} via ${run.forkID} (${run.finished ? "done" : "timeout"}): ${preview(question)}`);
+  return run;
 }
 
 /**
- * `/bt` from the TUI: the same run, but the answer goes back into the session it
- * was asked from, as a synthetic message.
+ * `/bt` from the TUI: the same run, and the answer goes out both ways.
+ *
+ * The QQ push is not decoration: a `synthetic` message is stored in the session
+ * but the TUI does not render it (verified - the text was in the transcript and
+ * yet invisible), so a TUI-only aside would answer into the void.
  */
 async function runAsideTui(sessionID: string, question: string): Promise<void> {
-  const run = await runAsideCore(sessionID, question);
+  const directory = await sessionDirectory(sessionID).catch(() => "?");
+  const num = sessionNumbers.lookup(sessionID);
+  const tag = `[${num !== undefined ? `#${num} ` : ""}${directory}]`;
+  const run = await runAside(sessionID, num, tag, question);
+
   const branch = run.forkNum !== undefined ? `（分支 #${run.forkNum}）` : "";
   const body = run.error ? `失败：${run.error}` : asideBody(run, 12_000);
   try {
     await client().session.synthetic({ sessionID, text: `**旁问${branch}**\n\n${body}` });
-    log(`bt(tui) answered for ${sessionID}: ${preview(question)}`);
+    log(`bt(tui) posted the answer into ${sessionID}: ${preview(question)}`);
   } catch (cause) {
     log(`bt(tui) could not post the answer: ${cause instanceof Error ? cause.message : cause}`);
   }
