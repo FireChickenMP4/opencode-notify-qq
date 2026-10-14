@@ -1014,8 +1014,6 @@ async function runAside(
     target,
     question,
     async ({ forkID, forkNum, agent, agentError }) => {
-      // Approvals from any aside go to QQ, however the aside was started.
-      asidePush.set(forkID, true);
       if (!push) return;
       const who = agentError
         ? `agent 换不上（${agentError}），沿用会话自己的`
@@ -1026,7 +1024,6 @@ async function runAside(
     },
     options.keep === true,
   );
-  if (run.forkID) asidePush.delete(run.forkID);
   if (run.error) {
     if (push) await sendText(`旁问(工具)失败 ${tag}：${run.error}`);
     return run;
@@ -1045,15 +1042,6 @@ async function runAside(
 
 /** The last branch a TUI `/bt` kept for reading; the next one replaces it. */
 let lastKeptAside: string | undefined;
-
-/**
- * Asides whose approvals must be pushed.
- *
- * Every aside goes in here: an aside is a background fork, and the TUI only prompts
- * for the session the user is looking at, so a suppressed approval means the aside
- * waits for nobody until its hard cap. Dropped when the aside ends.
- */
-const asidePush = new Map<string, true>();
 
 /**
  * `/bt` from the TUI: run it, keep the branch, and let the CLI plugin navigate to
@@ -1495,12 +1483,12 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
 
     pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
     // Tracked above either way (the aside wait and the QQ reply both use it). The
-    // push follows the away switch, except for asides: a background fork cannot be
-    // approved anywhere else, so its requests always go out.
-    const asideWantsPush = anySessionID ? asidePush.has(anySessionID) : false;
-    if (loadConfig().awayNotify || asideWantsPush) {
+    // push follows the away switch: at the computer the CLI plugin asks about an
+    // aside's request in a dialog of its own, and the TUI asks about the session you
+    // are looking at.
+    if (loadConfig().awayNotify) {
       await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
-      log(`permission ${requestID} (${permission}) -> QQ${asideWantsPush ? " (aside)" : ""}`);
+      log(`permission ${requestID} (${permission}) -> QQ`);
     } else {
       log(`permission ${requestID} (${permission}) not pushed (awayNotify off)`);
     }

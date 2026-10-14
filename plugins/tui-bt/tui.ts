@@ -22,6 +22,48 @@ export default Plugin.define({
       return route?.type === "session" && route.sessionID ? route.sessionID : undefined;
     }
 
+    /**
+     * Approvals for an aside branch, asked here instead of by QQ.
+     *
+     * The TUI's own prompt covers the session the user is looking at, and an aside is
+     * a background fork - so without this its request is invisible, and the aside
+     * waits for nobody.
+     */
+    const answered = new Set<string>();
+    context.data.on("permission.asked", (event) => {
+      void (async () => {
+        const data = event.data as { id?: string; sessionID?: string; action?: string; resources?: string[] };
+        const requestID = data.id;
+        const sessionID = data.sessionID;
+        if (!requestID || !sessionID || answered.has(requestID)) return;
+        const title = context.data.session.get(sessionID)?.title ?? "";
+        if (!title.startsWith("旁问 ·")) return;
+
+        answered.add(requestID);
+        const detail = (data.resources ?? []).join(" ").trim();
+        const choice = await context.ui.dialog.select<"once" | "always" | "reject">({
+          title: `旁问需要授权 · ${data.action ?? "工具"}`,
+          placeholder: detail.slice(0, 120),
+          options: [
+            { title: "允许一次", value: "once" },
+            { title: "始终允许（记住）", value: "always" },
+            { title: "拒绝", value: "reject" },
+          ],
+        });
+        if (!choice) return;
+        try {
+          await context.client.permission.reply({ sessionID, requestID, decision: choice });
+          context.ui.toast.show({
+            message: choice === "reject" ? "已拒绝旁问的请求" : "已允许旁问的请求",
+            variant: choice === "reject" ? "warning" : "success",
+          });
+        } catch (cause) {
+          const why = cause instanceof Error ? cause.message : String(cause);
+          context.ui.toast.show({ message: `旁问审批回复失败：${why}`, variant: "error" });
+        }
+      })();
+    });
+
     async function ask(
       question: string,
       onSent?: (message: string) => void,
