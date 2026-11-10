@@ -15,7 +15,7 @@
  */
 
 import type { Plugin } from "@opencode/plugin";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,7 @@ const {
   pickFinalText,
   pickFallbackText,
   normalizeFinalText,
+  bashAlertKey,
 } = await (async (): Promise<typeof import("../src/notify-helpers.ts")> => {
   for (const p of ["./notify-qq/notify-helpers.ts", "../src/notify-helpers.ts"]) {
     try {
@@ -147,7 +148,34 @@ const PERMISSION_GRACE_MS = Number(process.env.OPENCODE_NOTIFY_QQ_PERMISSION_GRA
 const DEDUP_MS = Number(process.env.OPENCODE_NOTIFY_QQ_DEDUP_MS ?? 5000);
 const DEDUP_DIR = join(tmpdir(), "opencode-notify", "notify-qq");
 
+/** Last stale-claim sweep, so cleaning up costs one readdir per window. */
+let lastClaimSweep = 0;
+
+/**
+ * Drop claims whose window is over. Every key (one per long command, one per
+ * event kind) leaves a directory behind, and without this they accumulate for
+ * the life of the temp folder.
+ */
+function pruneClaims(now: number): void {
+  if (now - lastClaimSweep < DEDUP_MS) return;
+  lastClaimSweep = now;
+  try {
+    for (const name of readdirSync(DEDUP_DIR)) {
+      const path = join(DEDUP_DIR, name);
+      try {
+        if (now - statSync(path).mtimeMs >= DEDUP_MS) rmSync(path, { recursive: true, force: true });
+      } catch {
+        /* vanished while sweeping */
+      }
+    }
+  } catch {
+    /* no dedup dir yet */
+  }
+}
+
 function shouldSend(kind: string): boolean {
+  const now = Date.now();
+  pruneClaims(now);
   const claim = join(DEDUP_DIR, kind);
   try {
     mkdirSync(DEDUP_DIR, { recursive: true });
@@ -161,7 +189,7 @@ function shouldSend(kind: string): boolean {
     }
     try {
       // A winner that never came back (crash) must not block the kind forever.
-      if (Date.now() - statSync(claim).mtimeMs >= DEDUP_MS) {
+      if (now - statSync(claim).mtimeMs >= DEDUP_MS) {
         rmSync(claim, { recursive: true, force: true });
         return shouldSend(kind);
       }
@@ -463,6 +491,9 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
           cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
         }, ({ callID, startMs }) => {
           if (!awayEnabled()) return;
+          // Two plugin instances each run a BashWatch, so the same call would
+          // alert twice; the call id is the shared key.
+          if (!shouldSend(bashAlertKey(callID))) return;
           const cmd = bashCommands.get(callID) ?? "";
           void trySend(api!.bashAlert(cmd, Date.now() - startMs), true);
           trace(`bash long: ${cmd.slice(0, 60)}`);
