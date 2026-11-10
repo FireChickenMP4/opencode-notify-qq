@@ -489,6 +489,26 @@ test("only the first field is answered when the form asks several questions", ()
   expect(buildAnswerPayload(fields, "yes")).toEqual({ q0: ["yes"] });
 });
 
+test("fields are filled left to right, separated by |", () => {
+  const fields = [questionField("q0", "string"), questionField("q1", "string")];
+  expect(buildAnswerPayload(fields, "生产 | 明天")).toEqual({ q0: "生产", q1: "明天" });
+});
+
+test("a missing later answer is left out, so the server rejects and the form can be retried", () => {
+  const fields = [questionField("q0", "string"), questionField("q1", "string")];
+  expect(buildAnswerPayload(fields, "生产")).toEqual({ q0: "生产" });
+});
+
+test("a multi-field form lists every field and the pipe-separated hint", () => {
+  const fields = [
+    questionField("q0", "multiselect", [{ value: "prod", label: "生产" }]),
+    { key: "q1", type: "string", title: "时间" },
+  ];
+  const text = formatForm("D:\\work", "选环境", fields, 2);
+  expect(text).toContain("字段 2：时间");
+  expect(text).toContain(".answer 答案1 | 答案2");
+});
+
 test("a plain string field keeps a bare string", () => {
   expect(buildAnswerPayload([questionField("q0", "string")], "自由文本")).toEqual({
     q0: "自由文本",
@@ -515,6 +535,14 @@ test(".new takes the whole rest of the line as its first message", () => {
 test(".new without body is still a command, so the caller can show usage", () => {
   expect(parseCommand(".new")).toEqual({ kind: "new", text: "", target: undefined });
   expect(parseCommand(".new   ")).toEqual({ kind: "new", text: "", target: undefined });
+});
+
+test(".new keeps a leading #N as message text, because it has no target", () => {
+  expect(parseCommand(".new #3 看一下这个")).toEqual({
+    kind: "new",
+    text: "#3 看一下这个",
+    target: undefined,
+  });
 });
 
 test(".news is not .new", () => {

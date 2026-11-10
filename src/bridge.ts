@@ -195,7 +195,17 @@ async function sessionIsBusy(sessionID: string): Promise<boolean> {
 // Pending requests
 // ---------------------------------------------------------------------------
 
-type Pending = { requestID: string; sessionID: string; permission: string };
+type Pending = {
+  requestID: string;
+  sessionID: string;
+  permission: string;
+  /**
+   * The QQ push was delivered - or deliberately skipped because `awayNotify` was
+   * off. A request still at false is retried by the compensation sweep, so a
+   * failed send is not the end of the only channel to the user.
+   */
+  pushed: boolean;
+};
 
 const pending = new Map<string, Pending>();
 
@@ -269,7 +279,8 @@ export type Command =
  *   .bt   <question>  side question that MAY use tools: answered in a throwaway
  *                     fork of the session, so it still leaves no trace
  *   .answer <text>    answer the question the agent is waiting on (`.answer` with
- *                     nothing waiting is a no-op)
+ *                     nothing waiting is a no-op); several fields take
+ *                     `.answer 答案1 | 答案2`, in field order
  *   .new  <text>      create a new session in the current workspace, with <text>
  *                     as its first message
  *   .b               move the running turn's foreground tools to the background
@@ -279,7 +290,8 @@ export type Command =
  *   .status           report the target session's turn/tool state (stuck detector)
  *   .list             list the sessions this bridge can address, with their #N
  *
- * Any command may name a session by number: `.stop #2`, `.task #1 do x`. The
+ * Any command may name a session by number: `.stop #2`, `.task #1 do x`. `.new`
+ * is the exception: it creates a session, so a leading "#N" is message text. The
  * leading dot accepts ASCII, full-width, or the Chinese ideographic full stop,
  * since a phone IME often produces the last one.
  */
@@ -302,6 +314,11 @@ export function parseCommand(text: string): Command | undefined {
     | "list";
   let rest = (m[2] ?? "").trim();
 
+  // `.new` has no target, so a leading "#3" is part of the first message, not a
+  // session choice. A bare ".new" still reaches the caller, which replies with
+  // the usage line instead of staying silent.
+  if (kind === "new") return { kind, text: rest };
+
   // Optional leading "#N" target. Stripped before the body is taken, so
   // `.task #2 deploy` has body "deploy" and target 2.
   let target: number | undefined;
@@ -320,9 +337,6 @@ export function parseCommand(text: string): Command | undefined {
   ) {
     return { kind, target };
   }
-  // A bare ".new" still reaches the caller, which replies with the usage line
-  // instead of staying silent.
-  if (kind === "new") return { kind, text: rest, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
   return { kind, text: rest, target };
 }
@@ -1193,6 +1207,15 @@ async function sendGit(target: string, tag: string): Promise<void> {
 }
 
 /**
+ * Agent a `.new` session runs as.
+ *
+ * A session created without one takes the server default ("plan"), which can
+ * only read and propose - useless for "start a new conversation and do this".
+ * `.new` means "go work on it", so it asks for the acting agent by name.
+ */
+const NEW_SESSION_AGENT = "yolo";
+
+/**
  * `.new`: create a session in the same workspace as the current one and send the
  * text as its first message.
  *
@@ -1218,7 +1241,10 @@ async function createSession(text: string): Promise<void> {
       return;
     }
 
-    const created = await client().session.create({ location: { directory } });
+    const created = await client().session.create({
+      location: { directory },
+      agent: NEW_SESSION_AGENT,
+    });
     const id = created?.id;
     if (!id) throw new Error("session.create 没有返回会话 id");
     createdID = id;
@@ -1232,8 +1258,8 @@ async function createSession(text: string): Promise<void> {
     await prompt(id, text);
     markCommandOutcome(id);
     const label = num !== undefined ? `#${num}` : id;
-    await sendText(`新会话 ${label} 已创建: ${text.slice(0, 80)}`);
-    log(`new session ${id} (${label}) in ${directory}: ${preview(text)}`);
+    await sendText(`新会话 ${label} 已创建（${NEW_SESSION_AGENT}）: ${text.slice(0, 80)}`);
+    log(`new session ${id} (${label}) in ${directory} as ${NEW_SESSION_AGENT}: ${preview(text)}`);
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
     // A session may already exist when only the first message failed; name it so
@@ -1530,12 +1556,15 @@ const PERMISSION_SWEEP_MS = 60_000;
 let sweepRunning = false;
 
 /**
- * Re-list pending approvals per known workspace and push any the bridge missed.
+ * Re-list pending approvals per known workspace and (re)push what the bridge
+ * missed.
  *
  * The CLI plugin deliberately stays quiet while the bridge runs, so a dropped
  * `permission.asked` event would leave the user with no prompt at all. This is
  * the safety net. It only ADDS to `pending`: an empty list never deletes, which
- * keeps the conservative pruning in `reconcilePending` intact.
+ * keeps the conservative pruning in `reconcilePending` intact. An entry whose
+ * push failed keeps `pushed: false` and is retried next round, because QQ is the
+ * only channel that reaches the user.
  */
 async function sweepPendingPermissions(): Promise<void> {
   if (sweepRunning || !oc) return;
@@ -1546,24 +1575,29 @@ async function sweepPendingPermissions(): Promise<void> {
       if (session.directory) directories.add(session.directory);
     }
 
-    // Only locations the service has loaded can own pending requests. Sessions
-    // from an old workspace answer "Location not found" and would turn every
-    // sweep into a log storm. Best-effort: if the route is unavailable, sweep
-    // every known directory instead.
-    let loaded: Set<string> | null = null;
+    // Only locations the service has loaded can own pending requests; a session
+    // from a workspace it forgot answers "Location not found". The route is also
+    // transiently unavailable right after a service start, and scanning every
+    // known directory then produced dozens of those errors for nothing - skip
+    // the round and let the next sweep (60s) cover it.
+    let loaded: Set<string>;
     try {
       loaded = new Set((await client().debug.location.list()).map((entry) => entry.directory));
-    } catch {
-      /* fall back to every known directory */
+    } catch (cause) {
+      log(`permission sweep deferred: location list unavailable (${errorMessage(cause)})`);
+      return;
     }
 
     for (const directory of directories) {
-      if (loaded && !loaded.has(directory)) continue;
+      if (!loaded.has(directory)) continue;
       let raw: unknown;
       try {
         raw = await client().permission.request.list({ location: { directory } });
       } catch (cause) {
-        log(`permission sweep failed for ${directory}: ${cause instanceof Error ? cause.message : cause}`);
+        // A location evicted between the two calls is expected, not a failure.
+        if (!/location not found/i.test(errorMessage(cause))) {
+          log(`permission sweep failed for ${directory}: ${errorMessage(cause)}`);
+        }
         continue;
       }
 
@@ -1580,32 +1614,40 @@ async function sweepPendingPermissions(): Promise<void> {
         };
         const requestID = asString(item.id);
         const sessionID = asString(item.sessionID);
-        if (!requestID || !sessionID || pending.has(requestID)) continue;
+        if (!requestID || !sessionID) continue;
+
+        const known = pending.get(requestID);
+        if (known?.pushed) continue;
 
         const permission = typeof item.action === "string" ? item.action : "unknown";
         const patterns = Array.isArray(item.resources) ? item.resources.map(String) : [];
         const metadata = (item.metadata ?? {}) as Record<string, unknown>;
-        pending.set(requestID, { requestID, sessionID, permission });
-        const num = rememberSession(sessionID);
-        const aside = asideIds.has(sessionID) || asideSeen.has(sessionID);
+        const record: Pending = known ?? { requestID, sessionID, permission, pushed: false };
+        if (!known) pending.set(requestID, record);
 
         if (!loadConfig().awayNotify) {
+          // Not a delivery to retry: the switch says "do not push".
+          record.pushed = true;
           log(`permission ${requestID} (${permission}) recovered, not pushed (awayNotify off)`);
           continue;
         }
+
+        const num = rememberSession(sessionID);
+        const aside = asideIds.has(sessionID) || asideSeen.has(sessionID);
         try {
           await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
+          record.pushed = true;
           log(`permission ${requestID} (${permission}) recovered -> QQ`);
         } catch (cause) {
-          // Keep the entry so a QQ reply can still answer it; one recovery push
-          // is the contract, so the next sweep must not try again.
-          log(`permission ${requestID} recovery push failed: ${cause instanceof Error ? cause.message : cause}`);
+          log(
+            `permission ${requestID} recovery push failed (retry next sweep): ${errorMessage(cause)}`,
+          );
         }
       }
     }
   } catch (cause) {
     // A sweep must never take the daemon down.
-    log(`permission sweep failed: ${cause instanceof Error ? cause.message : cause}`);
+    log(`permission sweep failed: ${errorMessage(cause)}`);
   } finally {
     sweepRunning = false;
   }
@@ -1622,36 +1664,49 @@ export function questionOf(form: { title?: string; fields?: FormField[] } | unde
 type FormAnswerValue = string | string[];
 
 /**
- * Map a typed reply onto the form's first answerable field, shaped for the API.
+ * Map a typed reply onto the form's fields, shaped for the API.
  *
  * The server validates every answer against its field type: a `multiselect`
  * field (a `question` asked with `multiple: true`) takes a string array, while a
  * `string` field takes a bare string. Sending a string to a multiselect is what
  * produced "Expected string array for form field: q0".
  *
- * Matching an option's value or label wins, so `.answer 生产` sends the value the
- * form expects; anything else is sent as free text. Only the first field is
- * answered: the `question` tool numbers its fields q0, q1, ..., and one typed
- * reply belongs to the first one rather than being copied onto all of them.
+ * Fields are filled left to right, `|` between answers: a form asking three
+ * things is answered with `.answer 生产 | 是 | 明天`. Fewer parts than fields
+ * leaves the rest unanswered - the server rejects that reply and the form stays
+ * pending, so the user can retry with every field instead of being silently
+ * stuck on the first one. Matching an option's value or label wins, so
+ * `.answer 生产` sends the value the form expects; anything else is free text.
  * An empty reply is not an answer at all, so it yields null.
  */
 export function buildAnswerPayload(
   fields: FormField[],
   text: string,
 ): Record<string, FormAnswerValue> | null {
-  const field = fields.find((f) => typeof f.key === "string" && f.key);
-  if (!field?.key) return null;
-  const typed = text.trim();
-  if (!typed) return null;
-  const wanted = typed.toLowerCase();
+  const answerable = fields.filter((f) => typeof f.key === "string" && f.key);
+  if (!answerable.length) return null;
+
+  const parts = text.split("|").map((part) => part.trim());
+  const payload: Record<string, FormAnswerValue> = {};
+  answerable.forEach((field, index) => {
+    const part = parts[index];
+    if (!part) return;
+    payload[field.key as string] = answerValue(field, part);
+  });
+  return Object.keys(payload).length ? payload : null;
+}
+
+/** One field's answer, shaped for the API (see `buildAnswerPayload`). */
+function answerValue(field: FormField, part: string): FormAnswerValue {
+  const wanted = part.toLowerCase();
   const options = Array.isArray(field.options) ? field.options : [];
   const hit = options.find((o) => {
     const value = typeof o.value === "string" ? o.value.toLowerCase() : "";
     const label = typeof o.label === "string" ? o.label.toLowerCase() : "";
     return value === wanted || label === wanted;
   });
-  const value = hit && typeof hit.value === "string" ? hit.value : typed;
-  return { [field.key]: field.type === "multiselect" ? [value] : value };
+  const value = hit && typeof hit.value === "string" ? hit.value : part;
+  return field.type === "multiselect" ? [value] : value;
 }
 
 /** Render a waiting question for QQ. Pure, so the layout is testable. */
@@ -1664,17 +1719,29 @@ export function formatForm(
   const header = sessionNum !== undefined ? `**需要你回答 · #${sessionNum}**` : `**需要你回答**`;
   const lines = [header, `目录: \`${directory}\``, "", question];
 
-  const first = fields.find((f) => typeof f.key === "string" && f.key);
-  const options = Array.isArray(first?.options) ? first.options : [];
-  if (options.length) {
-    lines.push("");
-    for (const o of options) {
-      const label = (typeof o.label === "string" && o.label) || (typeof o.value === "string" && o.value) || "";
-      lines.push(`- ${label}`);
+  const answerable = fields.filter((f) => typeof f.key === "string" && f.key);
+  answerable.forEach((field, index) => {
+    // The question line already carries the first field's title, so only the
+    // later fields need one - a form may ask several unrelated things.
+    if (index > 0) {
+      const title = typeof field.title === "string" && field.title ? field.title : field.key;
+      lines.push("", `**字段 ${index + 1}：${title}**`);
     }
-  }
+    const options = Array.isArray(field.options) ? field.options : [];
+    if (options.length) {
+      lines.push("");
+      for (const o of options) {
+        const label = (typeof o.label === "string" && o.label) || (typeof o.value === "string" && o.value) || "";
+        lines.push(`- ${label}`);
+      }
+    }
+  });
 
-  lines.push("", "回复  **.answer <你的答案>**（可写选项文字或自由文本）");
+  if (answerable.length > 1) {
+    lines.push("", "回复  **.answer 答案1 | 答案2**（按字段顺序，用 | 分隔；可写选项文字或自由文本）");
+  } else {
+    lines.push("", "回复  **.answer <你的答案>**（可写选项文字或自由文本）");
+  }
   return lines.join("\n");
 }
 
@@ -1796,15 +1863,18 @@ async function handleOpencodeEvent(event: OpencodeEvent): Promise<void> {
     const num = anySessionID ? rememberSession(anySessionID) : undefined;
     const aside = anySessionID ? asideIds.has(anySessionID) || asideSeen.has(anySessionID) : false;
 
-    pending.set(requestID, { requestID, sessionID: anySessionID ?? "", permission });
+    const record: Pending = { requestID, sessionID: anySessionID ?? "", permission, pushed: false };
+    pending.set(requestID, record);
     // Tracked above either way (the aside wait and the QQ reply both use it). The
     // push follows the away switch: at the computer the CLI plugin asks about an
     // aside's request in a dialog of its own, and the TUI asks about the session you
     // are looking at.
     if (loadConfig().awayNotify) {
       await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
+      record.pushed = true;
       log(`permission ${requestID} (${permission}) -> QQ`);
     } else {
+      record.pushed = true;
       log(`permission ${requestID} (${permission}) not pushed (awayNotify off)`);
     }
   } catch (cause) {
