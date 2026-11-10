@@ -19,6 +19,7 @@
  *   bun run src/bridge.ts --help
  */
 
+import { execFile } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -250,8 +251,10 @@ export function parseReply(text: string): Verdict | undefined {
 // ---------------------------------------------------------------------------
 
 export type Command =
-  | { kind: "task" | "ask" | "btw" | "bt" | "answer"; text: string; target?: number }
+  | { kind: "task" | "ask" | "btw" | "bt" | "answer" | "new"; text: string; target?: number }
   | { kind: "stop"; target?: number }
+  | { kind: "b"; target?: number }
+  | { kind: "git"; target?: number }
   | { kind: "list"; target?: number }
   | { kind: "status"; target?: number };
 
@@ -267,6 +270,11 @@ export type Command =
  *                     fork of the session, so it still leaves no trace
  *   .answer <text>    answer the question the agent is waiting on (`.answer` with
  *                     nothing waiting is a no-op)
+ *   .new  <text>      create a new session in the current workspace, with <text>
+ *                     as its first message
+ *   .b               move the running turn's foreground tools to the background
+ *                     (no-op when there is nothing to move)
+ *   .git              show the workspace's git status and diff (read-only)
  *   .stop             abort the running turn (highest priority)
  *   .status           report the target session's turn/tool state (stuck detector)
  *   .list             list the sessions this bridge can address, with their #N
@@ -276,9 +284,22 @@ export type Command =
  * since a phone IME often produces the last one.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = text.trim().match(/^[.．。]\s*(task|ask|btw|bt|answer|stop|status|list)\b\s*([\s\S]*)$/i);
+  const m = text
+    .trim()
+    .match(/^[.．。]\s*(task|ask|btw|bt|answer|new|b|git|stop|status|list)\b\s*([\s\S]*)$/i);
   if (!m) return undefined;
-  const kind = m[1]!.toLowerCase() as "task" | "ask" | "btw" | "bt" | "answer" | "stop" | "status" | "list";
+  const kind = m[1]!.toLowerCase() as
+    | "task"
+    | "ask"
+    | "btw"
+    | "bt"
+    | "answer"
+    | "new"
+    | "b"
+    | "git"
+    | "stop"
+    | "status"
+    | "list";
   let rest = (m[2] ?? "").trim();
 
   // Optional leading "#N" target. Stripped before the body is taken, so
@@ -290,7 +311,18 @@ export function parseCommand(text: string): Command | undefined {
     rest = (t[2] ?? "").trim();
   }
 
-  if (kind === "stop" || kind === "status" || kind === "list") return { kind, target };
+  if (
+    kind === "stop" ||
+    kind === "status" ||
+    kind === "list" ||
+    kind === "b" ||
+    kind === "git"
+  ) {
+    return { kind, target };
+  }
+  // A bare ".new" still reaches the caller, which replies with the usage line
+  // instead of staying silent.
+  if (kind === "new") return { kind, text: rest, target };
   if (!rest) return undefined; // a bare ".task" with no body is not a command
   return { kind, text: rest, target };
 }
@@ -697,10 +729,12 @@ export function asideRules(
   }
   return [
     ...read,
-    { action: "edit", resource: "*", effect: "ask" },
-    // Rules match normalized paths (slashes, case-insensitive on Windows).
+    // A side question must not be able to touch the project: an aside that edited
+    // (and even committed) under an "always" approval is exactly what this blocks.
+    // Experiments belong in the sandbox; real work wants asideTools: "full".
+    { action: "edit", resource: "*", effect: "deny" },
     { action: "edit", resource: `${sandbox.replace(/\\/g, "/")}/*`, effect: "allow" },
-    { action: "shell", resource: "*", effect: "ask" },
+    { action: "shell", resource: "*", effect: "deny" },
   ];
 }
 
@@ -780,9 +814,7 @@ export function asideFraming(
   const abilities: Record<"readonly" | "guarded" | "full", string> = {
     readonly:
       "另外：你在一份用完即弃的只读分支里（主会话不受影响）：可以读文件、搜索、查资料，但改不了文件、也跑不了命令。",
-    guarded: `另外：你在一份用完即弃的临时分支里（主会话不受影响）：可以读文件、搜索、查资料；改工作区文件或执行命令会弹审批给用户${
-      sandbox ? `，而写进沙盒目录 ${sandbox} 不用审批` : ""
-    }。`,
+    guarded: `另外：你在一份用完即弃的临时分支里（主会话不受影响）：可以读文件、搜索、查资料；**改不了工作区里的文件、也跑不了命令** —— 只有沙盒目录${sandbox ? ` ${sandbox}` : ""} 里可以写，想做实验就写那儿`,
     full: "另外：你在一份用完即弃的临时分支里（主会话不受影响）：读文件、搜索、改文件、执行命令都可以 —— 这一档不会弹审批，所以更要克制，只做回答这件事所需的最小动作。",
   };
   const tools =
@@ -1102,6 +1134,116 @@ async function runAsideTui(sessionID: string, question: string): Promise<AsideRu
   return run;
 }
 
+/** Cap a QQ message body, saying so when the tail was cut. */
+export function truncateForQq(text: string, max = 3000): string {
+  if (text.length <= max) return text;
+  const marker = "\n…（已截断）";
+  return `${text.slice(0, Math.max(0, max - marker.length))}${marker}`;
+}
+
+/** Total characters of one `.git` reply. */
+const GIT_MAX_CHARS = 3000;
+/** Only inline the full diff when the overview is this small. */
+const GIT_INLINE_MAX = 1200;
+
+/** Run one read-only git command; the arguments are never shell-parsed. */
+function runGit(directory: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "git",
+      args,
+      { cwd: directory, maxBuffer: 5 * 1024 * 1024, windowsHide: true },
+      (error, stdout) => {
+        if (error) reject(error);
+        else resolve(stdout);
+      },
+    );
+  });
+}
+
+/** Reply to `.git`: workspace status, a diff overview, and the diff when small. */
+async function sendGit(target: string, tag: string): Promise<void> {
+  const directory = await sessionDirectory(target).catch(() => "(unknown)");
+  if (!directory || directory === "(unknown)") {
+    await sendText(`无法确定 git 工作区 · ${tag}`);
+    log("command: git failed: no workspace");
+    return;
+  }
+
+  let status: string;
+  try {
+    status = (await runGit(directory, ["status", "--short"])).trimEnd();
+  } catch (cause) {
+    // A directory outside any repository is the common case, so answer plainly
+    // instead of letting the runCommand catch report a raw git failure.
+    await sendText(`不是 git 仓库（或无法执行 git）· ${tag}`);
+    log(`command: git failed in ${directory}: ${cause instanceof Error ? cause.message : cause}`);
+    return;
+  }
+
+  const stat = (await runGit(directory, ["diff", "--stat"])).trimEnd();
+  const parts = [status ? `**状态**\n\`\`\`\n${status}\n\`\`\`` : "工作区干净"];
+  if (stat) parts.push(`**改动概览**\n\`\`\`\n${stat}\n\`\`\``);
+  if (stat.length <= GIT_INLINE_MAX) {
+    const diff = (await runGit(directory, ["diff"])).trimEnd();
+    if (diff) parts.push(`**diff**\n\`\`\`\n${diff}\n\`\`\``);
+  }
+  await sendText(truncateForQq(`**git · ${tag}**\n\n${parts.join("\n\n")}`, GIT_MAX_CHARS));
+  log(`command: git in ${directory}`);
+}
+
+/**
+ * `.new`: create a session in the same workspace as the current one and send the
+ * text as its first message.
+ *
+ * The workspace comes from the session an untargeted command would act on, so a
+ * new session never lands in an unrelated directory. Nothing is queued and the
+ * current session is not touched: this conversation starts fresh.
+ */
+async function createSession(text: string): Promise<void> {
+  if (!text) {
+    await sendText("用法：.new <内容>（新建会话，内容作为第一条消息）");
+    log("command: new (no body)");
+    return;
+  }
+
+  let createdID: string | undefined;
+  let num: number | undefined;
+  try {
+    const current = await resolveTarget();
+    const directory = current ? await sessionDirectory(current.id) : "";
+    if (!current || !directory || directory === "(unknown)") {
+      await sendText(".new 失败: 没有已知会话，无法确定新会话要建在哪个工作区");
+      log("command: new failed: no workspace");
+      return;
+    }
+
+    const created = await client().session.create({ location: { directory } });
+    const id = created?.id;
+    if (!id) throw new Error("session.create 没有返回会话 id");
+    createdID = id;
+
+    // The session list is cached for a minute; without this the next registry
+    // refresh may not see the new session and prune the number just handed out.
+    sessions = null;
+    sessionsAt = 0;
+
+    num = rememberSession(id);
+    await prompt(id, text);
+    markCommandOutcome(id);
+    const label = num !== undefined ? `#${num}` : id;
+    await sendText(`新会话 ${label} 已创建: ${text.slice(0, 80)}`);
+    log(`new session ${id} (${label}) in ${directory}: ${preview(text)}`);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    // A session may already exist when only the first message failed; name it so
+    // the user can still reach it.
+    const where = createdID ? `（会话 ${num !== undefined ? `#${num}` : createdID} 已建，首条消息未发出）` : "";
+    await sendText(`.new 失败${where}: ${message}`);
+    log(`command: new failed: ${message}`);
+  }
+}
+
 async function runCommand(cmd: Command): Promise<void> {
   if (cmd.kind === "status") {
     await sendStatus(cmd.target);
@@ -1109,6 +1251,10 @@ async function runCommand(cmd: Command): Promise<void> {
   }
   if (cmd.kind === "list") {
     await sendList();
+    return;
+  }
+  if (cmd.kind === "new") {
+    await createSession(cmd.text);
     return;
   }
   const resolved = await resolveTarget(cmd.target);
@@ -1120,6 +1266,20 @@ async function runCommand(cmd: Command): Promise<void> {
   const { id: target, num } = resolved;
   const tag = `[${num !== undefined ? `#${num} ` : ""}${await sessionDirectory(target)}]`;
   try {
+    if (cmd.kind === "git") {
+      await sendGit(target, tag);
+      return;
+    }
+
+    if (cmd.kind === "b") {
+      // Move any active foreground tool (a long shell command) into background
+      // observation. The server treats an idle session as a no-op.
+      await client().session.background({ sessionID: target });
+      await sendText(`已转后台 ${tag}`);
+      log("command: b");
+      return;
+    }
+
     if (cmd.kind === "stop") {
       await client().session.interrupt({ sessionID: target });
       await sendText(`已中断 ${tag}`);
@@ -1169,8 +1329,8 @@ async function runCommand(cmd: Command): Promise<void> {
         log("answer ignored: no pending form");
         return;
       }
-      const answer = buildAnswer(form.fields, cmd.text);
-      if (!answer) throw new Error("这个表单没有可回答的字段");
+      const answer = buildAnswerPayload(form.fields, cmd.text);
+      if (!answer) throw new Error("这个表单没有可回答的字段（或答案为空）");
       await client().session.form.reply({ sessionID: target, formID: form.formID, answer });
       pendingForms.delete(form.formID);
       await sendText(`已回答 ${tag}: ${cmd.text.slice(0, 60)}`);
@@ -1265,6 +1425,27 @@ export function liveRequestIds(raw: unknown): Set<string> {
   return ids;
 }
 
+/** Message text of an error in any of the shapes the client can throw. */
+function errorMessage(cause: unknown): string {
+  if (typeof cause === "string") return cause;
+  if (cause instanceof Error) return cause.message;
+  if (cause && typeof cause === "object") {
+    const message = (cause as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return "";
+}
+
+/**
+ * True only when the server explicitly says the permission request does not
+ * exist. Matching is case-insensitive; a network failure or a generic "not
+ * found" must not be mistaken for it, or a transient error would silently drop
+ * a live request.
+ */
+export function isRequestNotFoundError(cause: unknown): boolean {
+  return /permission request not found/i.test(errorMessage(cause));
+}
+
 async function reconcilePending(): Promise<void> {
   if (!pending.size) return;
   // This endpoint takes a location and answers `{ location, data }`. Pruning is
@@ -1342,6 +1523,94 @@ export function formatPermission(
   return lines.join("\n");
 }
 
+/** Approval compensation interval: catch requests whose event never arrived. */
+const PERMISSION_SWEEP_MS = 60_000;
+
+/** True while a sweep is in flight, so a slow list call cannot overlap the next. */
+let sweepRunning = false;
+
+/**
+ * Re-list pending approvals per known workspace and push any the bridge missed.
+ *
+ * The CLI plugin deliberately stays quiet while the bridge runs, so a dropped
+ * `permission.asked` event would leave the user with no prompt at all. This is
+ * the safety net. It only ADDS to `pending`: an empty list never deletes, which
+ * keeps the conservative pruning in `reconcilePending` intact.
+ */
+async function sweepPendingPermissions(): Promise<void> {
+  if (sweepRunning || !oc) return;
+  sweepRunning = true;
+  try {
+    const directories = new Set<string>();
+    for (const session of await allSessions()) {
+      if (session.directory) directories.add(session.directory);
+    }
+
+    // Only locations the service has loaded can own pending requests. Sessions
+    // from an old workspace answer "Location not found" and would turn every
+    // sweep into a log storm. Best-effort: if the route is unavailable, sweep
+    // every known directory instead.
+    let loaded: Set<string> | null = null;
+    try {
+      loaded = new Set((await client().debug.location.list()).map((entry) => entry.directory));
+    } catch {
+      /* fall back to every known directory */
+    }
+
+    for (const directory of directories) {
+      if (loaded && !loaded.has(directory)) continue;
+      let raw: unknown;
+      try {
+        raw = await client().permission.request.list({ location: { directory } });
+      } catch (cause) {
+        log(`permission sweep failed for ${directory}: ${cause instanceof Error ? cause.message : cause}`);
+        continue;
+      }
+
+      const list = Array.isArray(raw)
+        ? raw
+        : ((raw as { data?: readonly unknown[] } | null)?.data ?? []);
+      for (const entry of list) {
+        const item = entry as {
+          id?: unknown;
+          sessionID?: unknown;
+          action?: unknown;
+          resources?: unknown;
+          metadata?: unknown;
+        };
+        const requestID = asString(item.id);
+        const sessionID = asString(item.sessionID);
+        if (!requestID || !sessionID || pending.has(requestID)) continue;
+
+        const permission = typeof item.action === "string" ? item.action : "unknown";
+        const patterns = Array.isArray(item.resources) ? item.resources.map(String) : [];
+        const metadata = (item.metadata ?? {}) as Record<string, unknown>;
+        pending.set(requestID, { requestID, sessionID, permission });
+        const num = rememberSession(sessionID);
+        const aside = asideIds.has(sessionID) || asideSeen.has(sessionID);
+
+        if (!loadConfig().awayNotify) {
+          log(`permission ${requestID} (${permission}) recovered, not pushed (awayNotify off)`);
+          continue;
+        }
+        try {
+          await sendWithRetry(formatPermission(directory, permission, metadata, patterns, num, aside));
+          log(`permission ${requestID} (${permission}) recovered -> QQ`);
+        } catch (cause) {
+          // Keep the entry so a QQ reply can still answer it; one recovery push
+          // is the contract, so the next sweep must not try again.
+          log(`permission ${requestID} recovery push failed: ${cause instanceof Error ? cause.message : cause}`);
+        }
+      }
+    }
+  } catch (cause) {
+    // A sweep must never take the daemon down.
+    log(`permission sweep failed: ${cause instanceof Error ? cause.message : cause}`);
+  } finally {
+    sweepRunning = false;
+  }
+}
+
 /** The question text of a form: the first titled field, else the form's own title. */
 export function questionOf(form: { title?: string; fields?: FormField[] } | undefined): string {
   const fields = Array.isArray(form?.fields) ? form.fields : [];
@@ -1349,17 +1618,31 @@ export function questionOf(form: { title?: string; fields?: FormField[] } | unde
   return first?.title ?? form?.title ?? "(无标题问题)";
 }
 
+/** One form answer: shape depends on the field type (see `buildAnswerPayload`). */
+type FormAnswerValue = string | string[];
+
 /**
- * Map a typed reply onto the form's first field.
+ * Map a typed reply onto the form's first answerable field, shaped for the API.
+ *
+ * The server validates every answer against its field type: a `multiselect`
+ * field (a `question` asked with `multiple: true`) takes a string array, while a
+ * `string` field takes a bare string. Sending a string to a multiselect is what
+ * produced "Expected string array for form field: q0".
  *
  * Matching an option's value or label wins, so `.answer 生产` sends the value the
  * form expects; anything else is sent as free text. Only the first field is
- * answerable - the `question` tool builds single-question forms.
+ * answered: the `question` tool numbers its fields q0, q1, ..., and one typed
+ * reply belongs to the first one rather than being copied onto all of them.
+ * An empty reply is not an answer at all, so it yields null.
  */
-export function buildAnswer(fields: FormField[], text: string): Record<string, string> | null {
+export function buildAnswerPayload(
+  fields: FormField[],
+  text: string,
+): Record<string, FormAnswerValue> | null {
   const field = fields.find((f) => typeof f.key === "string" && f.key);
   if (!field?.key) return null;
   const typed = text.trim();
+  if (!typed) return null;
   const wanted = typed.toLowerCase();
   const options = Array.isArray(field.options) ? field.options : [];
   const hit = options.find((o) => {
@@ -1367,7 +1650,8 @@ export function buildAnswer(fields: FormField[], text: string): Record<string, s
     const label = typeof o.label === "string" ? o.label.toLowerCase() : "";
     return value === wanted || label === wanted;
   });
-  return { [field.key]: hit && typeof hit.value === "string" ? hit.value : typed };
+  const value = hit && typeof hit.value === "string" ? hit.value : typed;
+  return { [field.key]: field.type === "multiselect" ? [value] : value };
 }
 
 /** Render a waiting question for QQ. Pure, so the layout is testable. */
@@ -1568,6 +1852,18 @@ async function handleQqEvent(event: GatewayEvent): Promise<void> {
         decision: reply,
       });
     } catch (cause) {
+      // The server explicitly says the request is gone: it was answered or
+      // cancelled elsewhere. Left in `pending`, it would sit at the head of the
+      // FIFO and make every later `.o/.a/.r` hit it again, so drop it here. The
+      // conservative liveness probe below stays for every other error, where an
+      // empty list proves nothing.
+      if (isRequestNotFoundError(cause)) {
+        pending.delete(target.requestID);
+        await sendText(`该审批已失效（可能已在电脑上处理）· ${target.permission}`);
+        log(`permission ${target.requestID} no longer exists; reply skipped`);
+        return;
+      }
+
       // A request answered elsewhere between the liveness check and the reply is
       // gone for good: say so instead of reporting a hard failure. Only a non-empty
       // answer that lacks the id proves it - an empty one proves nothing.
@@ -1778,8 +2074,13 @@ async function run(): Promise<number> {
   }
   log(`QQ gateway connected (lock port ${LOCK_PORT})`);
 
+  // Safety net for approvals whose event never reached us (see sweepPendingPermissions).
+  const permissionSweep = setInterval(() => void sweepPendingPermissions(), PERMISSION_SWEEP_MS);
+  permissionSweep.unref?.();
+
   const abort = new AbortController();
   const stop = () => {
+    clearInterval(permissionSweep);
     abort.abort();
     client.close();
     server?.stop(true);

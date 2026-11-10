@@ -34,6 +34,19 @@ export function runningBridgeIsCurrent(statePath: string, hash: string): boolean
 }
 
 /**
+ * Cross-instance dedup key for one bash long-command alert.
+ *
+ * opencode loads a local plugin more than once, and every load has its own
+ * BashWatch timer, so both instances alert for the same call. Keying on the
+ * tool call lets them claim the same dedup file. A colon is not a valid Windows
+ * filename character, and an unexpected call id must not escape the dedup dir,
+ * so everything outside [A-Za-z0-9_-] becomes "_".
+ */
+export function bashAlertKey(callID: string): string {
+  return `bash-${callID.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+
+/**
  * The message shapes the pickers read. V2 tags each message with `type` and
  * keeps assistant output in `content`; every other message kind is ignored.
  */

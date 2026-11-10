@@ -8,7 +8,8 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { asideFraming, asideRules, asideVisibleInList, buildAnswer, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, liveRequestIds, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
+import { asideFraming, asideRules, asideVisibleInList, buildAnswerPayload, isRequestNotFoundError, truncateForQq, fmtAgo, fmtDuration, formatForm, formatList, formatStatus, isAsideSession, lastAssistantText, liveRequestIds, parseCommand, parseReply, questionOf, renderTranscript, replyTarget, turnEnded } from "../src/bridge";
+import { bashAlertKey } from "../src/notify-helpers";
 
 describe("parseReply", () => {
   test("single letters, both cases", () => {
@@ -238,17 +239,17 @@ describe("form replies", () => {
   ];
 
   test("an option label or value maps to the option value", () => {
-    expect(buildAnswer(fields, "开发")).toEqual({ answer: "dev" });
-    expect(buildAnswer(fields, "prod")).toEqual({ answer: "prod" });
-    expect(buildAnswer(fields, " 生产 ")).toEqual({ answer: "prod" });
+    expect(buildAnswerPayload(fields, "开发")).toEqual({ answer: "dev" });
+    expect(buildAnswerPayload(fields, "prod")).toEqual({ answer: "prod" });
+    expect(buildAnswerPayload(fields, " 生产 ")).toEqual({ answer: "prod" });
   });
 
   test("free text is sent as-is", () => {
-    expect(buildAnswer(fields, "先别动")).toEqual({ answer: "先别动" });
+    expect(buildAnswerPayload(fields, "先别动")).toEqual({ answer: "先别动" });
   });
 
   test("a field without a key is not answerable", () => {
-    expect(buildAnswer([{ title: "no key" }], "x")).toBeNull();
+    expect(buildAnswerPayload([{ title: "no key" }], "x")).toBeNull();
   });
 
   test("the question push lists the options and the reply hint", () => {
@@ -351,8 +352,9 @@ describe("asideFraming", () => {
     expect(asideFraming("bt", "")).toContain("用完即弃的临时分支");
   });
 
-  test("the bt wording follows the mode: only guarded promises approvals", () => {
-    expect(asideFraming("bt", "", undefined, "guarded")).toContain("弹审批");
+  test("the bt wording follows the mode: guarded forbids work outside the sandbox", () => {
+    expect(asideFraming("bt", "", undefined, "guarded")).toContain("改不了工作区里的文件");
+    expect(asideFraming("bt", "", undefined, "guarded")).toContain("沙盒");
     expect(asideFraming("bt", "", undefined, "full")).toContain("不会弹审批");
     expect(asideFraming("bt", "", undefined, "readonly")).toContain("只读");
   });
@@ -382,9 +384,9 @@ describe("asideRules", () => {
     expect(find("readonly", "shell", "*")).toBe("deny");
   });
 
-  test("guarded asks outside the sandbox, allows inside it", () => {
-    expect(find("guarded", "edit", "*")).toBe("ask");
-    expect(find("guarded", "shell", "*")).toBe("ask");
+  test("guarded denies outside the sandbox, allows inside it", () => {
+    expect(find("guarded", "edit", "*")).toBe("deny");
+    expect(find("guarded", "shell", "*")).toBe("deny");
     expect(find("guarded", "read", "*")).toBe("allow");
     // The sandbox rule is listed last, so it wins for paths under it.
     expect(find("guarded", "edit", "C:/Users/me/AppData/Local/Temp/opencode/aside/ses_x/*")).toBe("allow");
@@ -456,4 +458,127 @@ describe("formatList", () => {
   test("says so when there is nothing to list", () => {
     expect(formatList([])).toContain("还没有见过会话");
   });
+});
+
+
+/** A `question` tool field: q0/q1..., multiselect when asked with `multiple`. */
+const questionField = (
+  key: string,
+  type = "multiselect",
+  options?: Array<{ value: string; label: string }>,
+) => ({ key, type, ...(options ? { options } : {}) });
+
+test("a multiselect field takes a one-element string array", () => {
+  expect(buildAnswerPayload([questionField("q0")], "生产环境")).toEqual({
+    q0: ["生产环境"],
+  });
+});
+
+test("an option matches by label or value and sends the form's value", () => {
+  const options = [
+    { value: "prod", label: "生产" },
+    { value: "dev", label: "开发" },
+  ];
+  const fields = [questionField("q0", "multiselect", options)];
+  expect(buildAnswerPayload(fields, "生产")).toEqual({ q0: ["prod"] });
+  expect(buildAnswerPayload(fields, "PROD")).toEqual({ q0: ["prod"] });
+});
+
+test("only the first field is answered when the form asks several questions", () => {
+  const fields = [questionField("q0"), questionField("q1")];
+  expect(buildAnswerPayload(fields, "yes")).toEqual({ q0: ["yes"] });
+});
+
+test("a plain string field keeps a bare string", () => {
+  expect(buildAnswerPayload([questionField("q0", "string")], "自由文本")).toEqual({
+    q0: "自由文本",
+  });
+});
+
+test("empty or whitespace-only text is not an answer", () => {
+  expect(buildAnswerPayload([questionField("q0")], "")).toBeNull();
+  expect(buildAnswerPayload([questionField("q0")], "   \n")).toBeNull();
+});
+
+test("a form with no answerable field yields null", () => {
+  expect(buildAnswerPayload([{ title: "no key" }], "x")).toBeNull();
+});
+
+test(".new takes the whole rest of the line as its first message", () => {
+  expect(parseCommand(".new 帮我看下 xxx")).toEqual({
+    kind: "new",
+    text: "帮我看下 xxx",
+    target: undefined,
+  });
+});
+
+test(".new without body is still a command, so the caller can show usage", () => {
+  expect(parseCommand(".new")).toEqual({ kind: "new", text: "", target: undefined });
+  expect(parseCommand(".new   ")).toEqual({ kind: "new", text: "", target: undefined });
+});
+
+test(".news is not .new", () => {
+  expect(parseCommand(".news")).toBeUndefined();
+  expect(parseCommand(".news 帮我看下")).toBeUndefined();
+});
+
+test("existing commands still parse", () => {
+  expect(parseCommand(".task 做 x")).toEqual({ kind: "task", text: "做 x", target: undefined });
+  expect(parseCommand(".ask 先看 y")).toEqual({ kind: "ask", text: "先看 y", target: undefined });
+  expect(parseCommand(".btw 是什么")).toEqual({ kind: "btw", text: "是什么", target: undefined });
+  expect(parseCommand(".bt 查一下")).toEqual({ kind: "bt", text: "查一下", target: undefined });
+  expect(parseCommand(".answer 生产")).toEqual({ kind: "answer", text: "生产", target: undefined });
+  expect(parseCommand(".stop")).toEqual({ kind: "stop", target: undefined });
+  expect(parseCommand(".status")).toEqual({ kind: "status", target: undefined });
+  expect(parseCommand(".list")).toEqual({ kind: "list", target: undefined });
+  expect(parseCommand(".task #2 deploy")).toEqual({ kind: "task", text: "deploy", target: 2 });
+});
+
+test(".b backgrounds the target session, optionally by number", () => {
+  expect(parseCommand(".b")).toEqual({ kind: "b", target: undefined });
+  expect(parseCommand(".b #2")).toEqual({ kind: "b", target: 2 });
+});
+
+test(".bg and .background are not .b", () => {
+  expect(parseCommand(".bg")).toBeUndefined();
+  expect(parseCommand(".background")).toBeUndefined();
+});
+
+test(".git targets the current session, optionally by number", () => {
+  expect(parseCommand(".git")).toEqual({ kind: "git", target: undefined });
+  expect(parseCommand(".git #3")).toEqual({ kind: "git", target: 3 });
+});
+
+test(".gits and .gita are not .git", () => {
+  expect(parseCommand(".gits")).toBeUndefined();
+  expect(parseCommand(".gita 状态")).toBeUndefined();
+});
+
+test("a long reply is truncated within the limit and says so", () => {
+  expect(truncateForQq("short", 100)).toBe("short");
+
+  const cut = truncateForQq("x".repeat(500), 100);
+  expect(cut.length).toBeLessThanOrEqual(100);
+  expect(cut.endsWith("（已截断）")).toBe(true);
+});
+
+test("the bash alert dedup key is stable and filename-safe", () => {
+  expect(bashAlertKey("call_abc")).toBe("bash-call_abc");
+  expect(bashAlertKey("call_abc")).toBe(bashAlertKey("call_abc"));
+  expect(bashAlertKey("a:b/c")).toBe("bash-a_b_c");
+  expect(bashAlertKey("a:b/c")).not.toContain(":");
+});
+
+test("a not-found reply is recognised in every error shape", () => {
+  expect(isRequestNotFoundError(new Error("Permission request not found: per_1"))).toBe(true);
+  expect(isRequestNotFoundError({ message: "permission request NOT found: per_1" })).toBe(true);
+  expect(isRequestNotFoundError("Permission request not found")).toBe(true);
+});
+
+test("other errors are not treated as a vanished request", () => {
+  expect(isRequestNotFoundError(new Error("fetch failed"))).toBe(false);
+  expect(isRequestNotFoundError({ message: "Permission denied" })).toBe(false);
+  expect(isRequestNotFoundError("Request not found")).toBe(false);
+  expect(isRequestNotFoundError({})).toBe(false);
+  expect(isRequestNotFoundError(undefined)).toBe(false);
 });
