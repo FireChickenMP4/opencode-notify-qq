@@ -6,13 +6,31 @@
  * installed `./notify-qq/`).
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
-/** Content hash of the bridge entry so a rebuilt daemon can be detected. */
+/**
+ * Content hash of the whole daemon: every module sitting next to the entry.
+ *
+ * Hashing only `bridge.ts` missed changes to `qqbot.ts` and friends - the plugin
+ * then kept a daemon built from the old source, and a fix in another module
+ * silently did nothing until the process was killed by hand.
+ */
 export function bridgeHash(script: string): string {
   try {
+    const dir = dirname(script);
+    const entry = basename(script);
+    const modules = readdirSync(dir)
+      .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
+      .sort();
+    // An entry that is not in its own directory (or not readable) means "cannot verify".
+    if (!modules.includes(entry)) return "";
     const hasher = new Bun.CryptoHasher("sha256");
-    hasher.update(readFileSync(script));
+    hasher.update(`entry:${entry}`);
+    for (const name of modules) {
+      hasher.update(name);
+      hasher.update(readFileSync(join(dir, name)));
+    }
     return hasher.digest("hex").slice(0, 16);
   } catch {
     return "";
