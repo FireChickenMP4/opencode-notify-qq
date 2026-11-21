@@ -223,6 +223,8 @@ export class QqBotClient {
   #lastSeq: number | null = null;
   #closed = false;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 连续重连次数，用于指数退避；连上（READY/RESUMED）即清零。 */
+  #reconnectAttempt = 0;
   readonly #options: QqBotClientOptions;
 
   constructor(options: QqBotClientOptions = {}) {
@@ -264,13 +266,17 @@ export class QqBotClient {
   #scheduleReconnect(): void {
     if (this.#closed || this.#options.autoReconnect === false) return;
     if (this.#reconnectTimer) return;
+    // 固定 3 秒在断网时会退化成每 3 秒一次的连接风暴，每次都要取网关地址、
+    // 新建 WebSocket。退避到 60 秒上限，连上之后清零。
+    const delay = Math.min(3000 * 2 ** this.#reconnectAttempt, 60_000);
+    this.#reconnectAttempt += 1;
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
       void this.connect().catch((e) => {
         this.#log(`reconnect failed: ${e}`);
         this.#scheduleReconnect();
       });
-    }, 3000);
+    }, delay);
   }
 
   /** 建立连接并完成鉴权。返回一个在首次 Ready 前完成的 Promise。 */
@@ -286,27 +292,48 @@ export class QqBotClient {
       const ws = new WebSocket(url);
       this.#ws = ws;
       let resolved = false;
+      let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+      // 一次性结算：连接只可能成功/失败一次，close 之后到达的 READY 不再改结果。
+      const settle = (): boolean => {
+        if (resolved) return false;
+        resolved = true;
+        if (handshakeTimer) clearTimeout(handshakeTimer);
+        return true;
+      };
+
+      // socket 连上但服务端一直不发 Hello 时，connect() 会永远不返回，
+      // run() 就停在这里，守护进程看着活着其实没订阅任何事件。
+      handshakeTimer = setTimeout(() => {
+        if (!settle()) return;
+        this.#log("gateway handshake timed out; retrying");
+        try {
+          ws.close();
+        } catch {
+          /* already gone */
+        }
+        reject(new QqBotError("gateway handshake timed out"));
+      }, 15_000);
 
       ws.addEventListener("open", () => this.#log("gateway connected"));
       ws.addEventListener("message", (ev) => {
         void this.#handleMessage(String((ev as MessageEvent).data), () => {
-          if (!resolved) {
-            resolved = true;
-            resolve();
-          }
+          this.#reconnectAttempt = 0;
+          if (settle()) resolve();
         });
       });
       ws.addEventListener("error", (ev) => {
         const detail = (ev as ErrorEvent).message ?? "unknown";
         this.#log(`gateway error: ${detail}`);
-        if (!resolved) {
-          resolved = true;
-          reject(new QqBotError(`websocket error: ${detail}`));
-        }
+        if (settle()) reject(new QqBotError(`websocket error: ${detail}`));
       });
       ws.addEventListener("close", (ev) => {
         this.#log(`gateway closed (code=${(ev as CloseEvent).code})`);
+        if (this.#ws === ws) this.#ws = null;
         this.#clearHeartbeat();
+        // READY 之前就关掉时，等待方不能悬着。
+        if (settle()) {
+          reject(new QqBotError(`gateway closed before ready (code=${(ev as CloseEvent).code})`));
+        }
         this.#scheduleReconnect();
       });
     });
